@@ -1,5 +1,24 @@
 # ASTRO V1
 
+A ROS 2 indoor service robot that navigates, recognizes the people it has met,
+and holds a spoken Turkish conversation. Every AI engine it depends on has a
+working fallback, so a missing API key or a dead network degrades the robot
+instead of stopping it.
+
+![demo](docs/demo.gif)
+
+## Tech stack
+
+![ROS 2 Humble](https://img.shields.io/badge/ROS_2-Humble-22314E?logo=ros&logoColor=white)
+![Python](https://img.shields.io/badge/Python-3.10-3776AB?logo=python&logoColor=white)
+![Arduino](https://img.shields.io/badge/Arduino-Mega_2560-00979D?logo=arduino&logoColor=white)
+![Nav2](https://img.shields.io/badge/Nav2-SLAM_Toolbox-22314E)
+![Gazebo](https://img.shields.io/badge/Gazebo-Simulation-FF6C00?logo=gazebo&logoColor=white)
+![OAK-D](https://img.shields.io/badge/OAK--D_Lite-DepthAI-FF1F5A)
+![Whisper](https://img.shields.io/badge/Faster--Whisper-STT-412991?logo=openai&logoColor=white)
+![XTTS](https://img.shields.io/badge/XTTS_v2-Voice_cloning-4B32C3)
+![License](https://img.shields.io/badge/License-Apache_2.0-blue)
+
 ASTRO V1 is a modular ROS 2 based robotics project containing drivers and launch files for base movement, LiDAR (RPLIDAR), Vision (OAK-D Lite), and Audio (ReSpeaker 4-Mic Array) systems.
 
 ## 🚀 ROS 2 Architecture
@@ -586,3 +605,72 @@ Paths are checked before the worker starts, so a typo is reported as `Özel XTTS
 - On CPU XTTS is very slow (RTF > 1, i.e. slower than real time). On an RTX 4050 Laptop with fp16 + batch=4 a paragraph runs at RTF ≈ 0.09 using ~1.5 GB VRAM.
 
 > **Note:** For AI API keys (`AI_API_KEY`), use the `.env` file at the root of the project (copy from `.env.example`). Do not hardcode API keys in the source code!
+
+---
+
+## 🧠 How it works — the design decision that shaped everything
+
+The robot depends on six things that can each fail independently: an LLM, speech
+recognition, speech synthesis, a depth camera, a LiDAR and a serial link to the
+motor board. Early versions treated each as required. In practice that meant one
+expired API key made the robot mute, or a `pip` conflict in a Whisper dependency
+made it deaf, and every failure looked the same from outside: a robot that sits
+there.
+
+So every engine is selected in `.env` and **every engine has a fallback chain**
+rather than a hard dependency:
+
+| Job | Primary | Falls back to |
+|---|---|---|
+| LLM | Groq, Gemini or OpenAI by config | the remaining providers in the chain |
+| Speech to text | OpenAI or Groq Whisper | local Faster-Whisper |
+| Speech synthesis | XTTS, OpenAI or ElevenLabs | `edge-tts`, then `espeak` |
+
+Two consequences are worth calling out because they were not obvious up front.
+
+**Selection has to skip, not reorder.** Providers *before* the selected one in
+the chain are skipped and the ones after remain as fallback. Choosing a provider
+therefore expresses a preference, not an exclusive choice, and there is no
+configuration that leaves the robot with nothing to fall back on.
+
+**Loading has to be gated on selection.** Setting speech recognition to anything
+other than `faster-whisper` prevents the local model from loading at all. Before
+that, the local model was loaded eagerly "just in case" and cost gigabytes of
+VRAM on a machine that was never going to use it.
+
+The synthesis path shows the pattern end to end: XTTS takes 10 to 30 seconds to
+warm up, so sentences arriving before it is ready are spoken by `edge-tts` and
+the switchover is logged. The robot answers immediately and its voice improves
+mid-conversation, rather than staying silent until the good model is ready.
+
+A configuration checker validates that all 101 keys are read somewhere in the
+code and that none are duplicated, because a silently-unused config key is a
+setting you believe you changed.
+
+---
+
+## ⚠️ Known limitations
+
+- Tuned for one physical build: an Arduino Mega base, RPLIDAR A1, OAK-D Lite and
+  a ReSpeaker 4-mic array. Pin maps and frame offsets are specific to it.
+- Navigation is validated in Gazebo and in one mapped indoor space. It has no
+  dynamic-obstacle or crowd handling.
+- Face and speaker recognition store personal biometric data. `faces/`,
+  `Persons/` and the memory files are gitignored for that reason and must not be
+  committed.
+- Speech recognition accuracy in Turkish drops noticeably with background noise
+  and with more than one speaker.
+- Local XTTS on CPU is slower than real time. It needs a GPU to be usable.
+- The conversation state machine is rule-based, so it handles interruptions and
+  topic changes poorly.
+- **Repository history.** This repo was started from a fork, so its commit
+  history contains a large amount of unrelated upstream work. All current source
+  is this project's own.
+
+## 🗺️ Roadmap
+
+- Dynamic obstacle avoidance and recovery behaviors in Nav2.
+- Speaker diarization so multi-person conversation is tracked properly.
+- Move the conversation manager off hand-written rules.
+- Onboard deployment on Jetson with measured end-to-end latency.
+- Relocate to a clean repository so the history reflects the actual work.
