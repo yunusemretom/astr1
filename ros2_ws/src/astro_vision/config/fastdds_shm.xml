@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Shared-memory transport for the on-robot DDS graph.
+
+  A 640x480 bgr8 frame is 900 KB. Linux ships net.core.rmem_max at 212992 bytes, so
+  the receiving socket cannot hold even one frame: FastDDS fragments the message over
+  UDP, the buffer overflows, and the whole frame is discarded. Measured effect on the
+  camera path — the publisher sent 30 Hz and face_detector_node received 5.8 Hz, a
+  ~70% loss, with the detector idle 92% of the time waiting for images.
+
+  Declaring an SHM transport with a segment large enough for a burst of frames moves
+  same-host traffic off UDP entirely: the detector then receives the full 30 Hz.
+
+  UDPv4 is kept alongside it so off-host tooling (rviz, ros2 topic from a laptop)
+  still works; FastDDS prefers shared memory when both peers are on this machine.
+
+  Applied automatically by astro_vision/launch/camera.launch.py; export
+  FASTRTPS_DEFAULT_PROFILES_FILE to this path to extend it to the whole graph.
+-->
+<dds xmlns="http://www.eprosima.com">
+  <profiles>
+    <transport_descriptors>
+      <transport_descriptor>
+        <transport_id>shm_large_frames</transport_id>
+        <type>SHM</type>
+        <!-- 64 MB: ~70 uncompressed VGA frames, far more headroom than any burst. -->
+        <segment_size>67108864</segment_size>
+      </transport_descriptor>
+      <transport_descriptor>
+        <transport_id>udp_offhost</transport_id>
+        <type>UDPv4</type>
+      </transport_descriptor>
+    </transport_descriptors>
+
+    <participant profile_name="astro_shm_first" is_default_profile="true">
+      <rtps>
+        <userTransports>
+          <transport_id>shm_large_frames</transport_id>
+          <transport_id>udp_offhost</transport_id>
+        </userTransports>
+        <!-- The builtin pair is replaced, not added to: leaving it on reinstates the
+             default SHM descriptor, whose segment is too small for a 900 KB frame. -->
+        <useBuiltinTransports>false</useBuiltinTransports>
+      </rtps>
+    </participant>
+  </profiles>
+</dds>

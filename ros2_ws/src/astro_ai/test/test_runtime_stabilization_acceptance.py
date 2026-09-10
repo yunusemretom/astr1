@@ -351,6 +351,11 @@ class TestDOAJitterFiltering(unittest.TestCase):
             tracker.consensus_window_size = 5
             tracker.consensus_threshold = 3
             tracker.consensus_tolerance_deg = 18.0
+            # Vision fusion attributes (added in OAK-D integration)
+            tracker.vision_fusion_enabled = False  # Disable for DOA-only test
+            tracker._vision_person_detected = False
+            tracker._vision_head_yaw = 0.0
+            tracker._vision_last_seen_time = 0.0
             tracker._lock = unittest.mock.MagicMock()
             tracker._lock.__enter__ = unittest.mock.MagicMock(return_value=None)
             tracker._lock.__exit__ = unittest.mock.MagicMock(return_value=None)
@@ -362,10 +367,12 @@ class TestDOAJitterFiltering(unittest.TestCase):
             tracker._vad_active = True
             tracker._is_speaking = False
             tracker._is_playback_active = False
+            tracker._is_sleeping = False
             tracker._last_speech_time = 0.0
             tracker._last_gaze_switch_time = time.monotonic() - 5.0
             import collections
             tracker._doa_history = collections.deque(maxlen=5)
+
 
             logs = []
             logger_mock = MagicMock()

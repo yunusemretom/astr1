@@ -26,8 +26,10 @@ from std_msgs.msg import Bool, String, Float32, Int32
 
 try:
     from astro_vision.image_utils import bgr_to_imgmsg, imgmsg_to_bgr
+    from astro_vision.detection_quality import detect_faces_with_confidence
 except ImportError:
     from image_utils import bgr_to_imgmsg, imgmsg_to_bgr
+    from detection_quality import detect_faces_with_confidence
 
 
 class OakPerceptionNode(Node):
@@ -37,10 +39,12 @@ class OakPerceptionNode(Node):
         self.declare_parameter("input_topic", "/oak/rgb/image_raw")
         self.declare_parameter("depth_topic", "/oak/stereo/image_raw")
         self.declare_parameter("spatial_nn_topic", "/oak/nn/spatial_detections")
+        self.declare_parameter("frame_skip", 2)
 
         input_topic = self.get_parameter("input_topic").value
         depth_topic = self.get_parameter("depth_topic").value
         spatial_topic = self.get_parameter("spatial_nn_topic").value
+        self._frame_skip = max(1, int(self.get_parameter("frame_skip").value))
 
         # Load Cascades for CPU Fallback
         frontal_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
@@ -67,6 +71,7 @@ class OakPerceptionNode(Node):
         self.pub_yaw = self.create_publisher(Float32, "/vision/head_yaw", 10)
         self.pub_distance = self.create_publisher(Float32, "/vision/user_distance", 10)
         self.pub_emotion = self.create_publisher(String, "/vision/user_emotion", 10)
+        self.pub_recognized_person = self.create_publisher(String, "/vision/recognized_person", 10)
         self.pub_image = self.create_publisher(Image, "/vision/face_image", 10)
 
         # Subscribers
@@ -128,11 +133,29 @@ class OakPerceptionNode(Node):
             return -25.0 if eye_x < rw / 2.0 else 25.0
         return 0.0
 
-    def _detect_facial_emotion(self, face_roi_gray, w, h) -> str:
+    def _detect_facial_emotion(self, face_roi_gray, w, h, yaw: float = 0.0, eyes_found: bool = False) -> str:
         lower_face = cv2.resize(face_roi_gray[int(h * 0.5):, :], (96, 48), interpolation=cv2.INTER_AREA) if w > 96 else face_roi_gray[int(h * 0.5):, :]
         smiles = self.smile_cascade.detectMultiScale(lower_face, scaleFactor=1.65, minNeighbors=10, minSize=(15, 15))
         if len(smiles) > 0:
             return "happy"
+
+        try:
+            mouth_region = lower_face[int(lower_face.shape[0] * 0.3):int(lower_face.shape[0] * 0.9), :]
+            if mouth_region.size > 0:
+                mean_val = float(np.mean(mouth_region))
+                std_val = float(np.std(mouth_region))
+                mh, mw = mouth_region.shape[:2]
+                center_patch = mouth_region[int(mh * 0.3):int(mh * 0.7), int(mw * 0.3):int(mw * 0.7)]
+                if center_patch.size > 0:
+                    center_mean = float(np.mean(center_patch))
+                    if center_mean < (mean_val - 18.0) and std_val > 22.0:
+                        return "surprised"
+        except Exception:
+            pass
+
+        if eyes_found and abs(yaw) <= 8.0:
+            return "focused"
+
         return "neutral"
 
     def image_callback(self, msg: Image):
@@ -144,8 +167,8 @@ class OakPerceptionNode(Node):
             return
 
         self._frame_count += 1
-        # 7.5 FPS processing for high efficiency
-        if self._frame_count % 4 != 0:
+        # Configurable frame skip for high efficiency (default 2 -> 15 FPS)
+        if self._frame_count % self._frame_skip != 0:
             return
 
         frame_h, frame_w = frame.shape[:2]
@@ -154,7 +177,8 @@ class OakPerceptionNode(Node):
         scale_ratio = 320.0 / float(frame_w) if frame_w > 320 else 1.0
         small_gray = cv2.resize(gray, (0, 0), fx=scale_ratio, fy=scale_ratio, interpolation=cv2.INTER_AREA) if scale_ratio < 1.0 else gray
 
-        detected_faces = self.face_cascade.detectMultiScale(
+        detected_faces = detect_faces_with_confidence(
+            self.face_cascade,
             small_gray,
             scaleFactor=1.1,
             minNeighbors=4,
@@ -162,9 +186,9 @@ class OakPerceptionNode(Node):
         )
 
         if len(detected_faces) > 0 and scale_ratio < 1.0:
-            faces = [[int(x / scale_ratio), int(y / scale_ratio), int(w / scale_ratio), int(h / scale_ratio)] for (x, y, w, h) in detected_faces]
+            faces = [[int(x / scale_ratio), int(y / scale_ratio), int(w / scale_ratio), int(h / scale_ratio), conf] for (x, y, w, h, conf) in detected_faces]
         else:
-            faces = list(detected_faces)
+            faces = [list(f) for f in detected_faces]
 
         # Temporal smoothing for dropout tolerance (up to 8 frames)
         if len(faces) == 0 and self._last_known_face is not None:
@@ -184,7 +208,7 @@ class OakPerceptionNode(Node):
         head_yaw = 0.0
         detected_emotion = "neutral"
 
-        for x, y, w, h in faces:
+        for x, y, w, h, detection_conf in faces:
             face_roi_gray = gray[y:y + h, x:x + w]
             yaw = self._estimate_head_yaw(face_roi_gray, w, h)
             head_yaw = yaw
@@ -194,10 +218,12 @@ class OakPerceptionNode(Node):
             if direct_gaze:
                 is_looking = True
 
-            detected_emotion = self._detect_facial_emotion(face_roi_gray, w, h)
+            detected_emotion = self._detect_facial_emotion(face_roi_gray, w, h, yaw=yaw, eyes_found=direct_gaze)
 
             face_list.append({
                 "x": int(x), "y": int(y), "width": int(w), "height": int(h),
+                "confidence": round(float(detection_conf), 2),
+                "frame_width": int(frame_w), "frame_height": int(frame_h),
                 "yaw_deg": round(yaw, 1),
                 "distance_m": round(dist_m, 2),
                 "looking_at_robot": direct_gaze,
@@ -242,6 +268,18 @@ class OakPerceptionNode(Node):
         e_msg = String()
         e_msg.data = smoothed_emotion
         self.pub_emotion.publish(e_msg)
+
+        recog_payload = {
+            "name": "Misafir",
+            "title": "Misafir",
+            "formal_title": "Misafir",
+            "confidence": 0.0,
+            "is_known": False,
+            "distance_m": round(user_distance, 2)
+        }
+        recog_msg = String()
+        recog_msg.data = json.dumps(recog_payload)
+        self.pub_recognized_person.publish(recog_msg)
 
         out_image = bgr_to_imgmsg(frame, msg.header)
         self.pub_image.publish(out_image)

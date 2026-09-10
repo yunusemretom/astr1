@@ -155,6 +155,10 @@ class SocialBrain:
             # Record turn in episodic memory
             self.episodic_memory.record_turn("user", user_text)
 
+            # Evolve relationship trust and familiarity
+            if p_name and p_name.lower() != "misafir":
+                self.relationship_manager.record_turn_interaction(p_name, valence=affect["valence"])
+
             return context, decision, prompt
 
     def _build_modular_prompt(

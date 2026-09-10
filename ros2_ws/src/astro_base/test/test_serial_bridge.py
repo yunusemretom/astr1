@@ -88,6 +88,20 @@ class TestSerialBridgeProtocol(unittest.TestCase):
         # Corrupted packet body will fail CRC check against original CRC byte
         self.assertNotEqual(pkt[-1], calc_crc)
 
+    def test_build_head_cmd_packet_angles(self):
+        """Verify binary packet building for head angles: 0, ±2, ±5, ±10, ±70 degrees."""
+        for angle in [0.0, 2.0, -2.0, 5.0, -5.0, 10.0, -10.0, 70.0, -70.0]:
+            payload = struct.pack("<f", angle)
+            pkt = build_packet(MSG_HEAD_CMD, payload)
+            self.assertEqual(pkt[0], SOF1)
+            self.assertEqual(pkt[1], SOF2)
+            self.assertEqual(pkt[2], 1 + len(payload))
+            self.assertEqual(pkt[3], MSG_HEAD_CMD)
+            unpacked_angle = struct.unpack("<f", pkt[4:8])[0]
+            self.assertAlmostEqual(unpacked_angle, angle, places=4)
+            calc_crc = crc8(pkt[2:-1])
+            self.assertEqual(pkt[-1], calc_crc)
+
 
 if __name__ == "__main__":
     unittest.main()

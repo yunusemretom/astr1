@@ -14,7 +14,6 @@ import logging
 _LOG = logging.getLogger(__name__)
 
 import re
-import struct
 import subprocess
 import threading
 import time
@@ -35,69 +34,7 @@ try:
 except ImportError:
     sd = None
 
-try:
-    import usb.core
-    import usb.util
-    HAS_USB = True
-except ImportError:
-    HAS_USB = False
-
-RESPEAKER_VID = 0x2886
-RESPEAKER_PID = 0x0018
-PARAM_SPEECH_DETECTED = 19
-PARAM_DOA_ANGLE = 21
-
-
-class ReSpeakerHID:
-    TIMEOUT_MS = 1000
-
-    def __init__(self):
-        self.dev = None
-        self._last_find_attempt = 0.0
-        self._find_device()
-
-    def _find_device(self):
-        if not HAS_USB:
-            return
-        now = time.monotonic()
-        if (now - self._last_find_attempt) < 5.0:
-            return
-        self._last_find_attempt = now
-        try:
-            self.dev = usb.core.find(idVendor=RESPEAKER_VID, idProduct=RESPEAKER_PID)
-        except Exception:
-            self.dev = None
-
-    def _read_param(self, param_id: int) -> Optional[int]:
-        if self.dev is None:
-            self._find_device()
-            if self.dev is None:
-                return None
-        try:
-            data = self.dev.ctrl_transfer(
-                usb.util.CTRL_IN | usb.util.CTRL_TYPE_VENDOR | usb.util.CTRL_RECIPIENT_DEVICE,
-                0,
-                param_id,
-                0,
-                8,
-                self.TIMEOUT_MS,
-            )
-            if data and len(data) >= 4:
-                return struct.unpack_from("i", data, 0)[0]
-            return None
-        except Exception:
-            self.dev = None
-            return None
-
-    def speech_detected(self) -> Optional[bool]:
-        val = self._read_param(PARAM_SPEECH_DETECTED)
-        return (val == 1) if val is not None else None
-
-    def doa_angle(self) -> Optional[float]:
-        val = self._read_param(PARAM_DOA_ANGLE)
-        if val is not None and 0 <= val <= 359:
-            return float(val)
-        return None
+from astro_audio.respeaker_usb import ReSpeakerHID
 
 
 RESPEAKER_NAME_HINTS = ("respeaker", "uac1", "seeed", "arrayuac", "4 mic array", "array uac")
@@ -337,14 +274,12 @@ class AudioCaptureNode(Node):
             self.pub_speech.publish(speech_msg)
 
     def _publish_hid(self):
-        if self.respeaker.dev:
-            try:
-                angle = self.respeaker.doa_angle()
-                msg = Float32()
-                msg.data = angle
-                self.pub_doa.publish(msg)
-            except Exception as _exc:
-                self.get_logger().debug(f"_publish_hid: yok sayılan hata ({_exc})")
+        # Okuyucu bağlantı yokken de çağrılır: sonradan takılan USB bulunabilsin.
+        angle = self.respeaker.doa_angle()
+        if angle is not None:
+            msg = Float32()
+            msg.data = angle
+            self.pub_doa.publish(msg)
 
     def destroy_node(self):
         if self.stream:

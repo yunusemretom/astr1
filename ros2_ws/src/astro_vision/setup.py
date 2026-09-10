@@ -13,7 +13,10 @@ setup(
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
         (os.path.join("share", package_name, "launch"), glob("launch/*.py")),
-        (os.path.join("share", package_name, "config"), glob("config/*.yaml")),
+        (
+            os.path.join("share", package_name, "config"),
+            glob("config/*.yaml") + glob("config/*.xml"),
+        ),
     ],
     install_requires=["setuptools"],
     zip_safe=True,
@@ -27,6 +30,7 @@ setup(
             "webcam_publisher_node = astro_vision.webcam_publisher_node:main",
             "oak_perception_node = astro_vision.oak_perception_node:main",
             "oak_spatial_native_node = astro_vision.oak_spatial_native_node:main",
+            "session_recorder = astro_vision.session_recorder:main",
         ],
     },
 )

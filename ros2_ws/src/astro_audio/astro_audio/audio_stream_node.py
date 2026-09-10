@@ -16,7 +16,7 @@ _LOG = logging.getLogger(__name__)
 import json
 import os
 import queue
-import struct
+import subprocess
 import sys
 import threading
 import time
@@ -42,6 +42,14 @@ except ImportError:
             return None
         def create_timer(self, *args, **kwargs):
             return None
+        def declare_parameter(self, *args, **kwargs):
+            return None
+        def has_parameter(self, *args, **kwargs):
+            return False
+        def get_parameter(self, *args, **kwargs):
+            class _Param:
+                value = None
+            return _Param()
         def destroy_node(self):
             pass
     class _MockMsg:
@@ -70,12 +78,156 @@ except ImportError:
 
 
 RESPEAKER_NAME_HINTS = ("respeaker", "uac1", "seeed", "arrayuac", "usb audio")
+RESPEAKER_ALSA_DEVICE = "plughw:CARD=ArrayUAC10,DEV=0"
 HW_SAMPLE_RATE = 16000  # ReSpeaker native hardware rate
 TARGET_SAMPLE_RATE = 24000  # OpenAI Realtime standard
 CHANNELS = 1
 DTYPE = "int16"
 CHUNK_MS = 20  # 20ms chunks = 320 samples @ 16kHz
 HW_BLOCK_SIZE = int(HW_SAMPLE_RATE * (CHUNK_MS / 1000.0))  # 320
+
+
+class ArecordStream:
+    """Direct ALSA raw PCM capture via arecord subprocess.
+
+    Used when PortAudio/sounddevice cannot enumerate ReSpeaker hardware
+    or falls back to virtual pulse/default devices on Linux/Jetson.
+    Provides identical callback interface as sounddevice.RawInputStream.
+    """
+
+    def __init__(
+        self,
+        alsa_device: str,
+        channels: int,
+        rate: int,
+        blocksize: int,
+        callback,
+        logger=None,
+    ):
+        self.alsa_device = alsa_device
+        self.channels = channels
+        self.rate = rate
+        self.blocksize = blocksize
+        self.callback = callback
+        self.logger = logger
+        self.chunk_bytes = blocksize * channels * 2  # 16-bit signed = 2 bytes/sample
+        self._proc: Optional[subprocess.Popen] = None
+        self._thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+        self.active = False
+        self.last_error: str = ""
+
+    def start(self):
+        self.stop()
+        cmd = [
+            "arecord",
+            "-D", self.alsa_device,
+            "-c", str(self.channels),
+            "-r", str(self.rate),
+            "-f", "S16_LE",
+            "-t", "raw",
+            "-q",
+        ]
+        try:
+            self._proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=self.chunk_bytes * 4,
+            )
+        except FileNotFoundError:
+            self.last_error = "'arecord' binary not found in system PATH"
+            if self.logger:
+                self.logger.error(f"❌ [ARECORD ERROR] {self.last_error}")
+            return
+        except Exception as exc:
+            self.last_error = f"Failed to spawn arecord: {exc}"
+            if self.logger:
+                self.logger.error(f"❌ [ARECORD ERROR] {self.last_error}")
+            return
+
+        # Brief delay to detect immediate initialization failures (e.g. invalid device or busy)
+        time.sleep(0.08)
+        if self._proc.poll() is not None:
+            stderr_msg = ""
+            try:
+                if self._proc.stderr:
+                    stderr_msg = self._proc.stderr.read().decode("utf-8", errors="replace").strip()
+            except Exception:
+                pass
+            self.last_error = f"arecord exited immediately with code {self._proc.returncode}: {stderr_msg}"
+            if self.logger:
+                self.logger.error(f"❌ [ARECORD ERROR] {self.last_error}")
+            self._proc = None
+            return
+
+        self._stop_event.clear()
+        self.active = True
+        self._thread = threading.Thread(
+            target=self._reader_loop, daemon=True, name="arecord_capture_reader"
+        )
+        self._thread.start()
+
+    def _read_exact(self, n: int) -> bytes:
+        chunks = []
+        bytes_read = 0
+        while bytes_read < n:
+            if self._stop_event.is_set() or self._proc is None:
+                return b""
+            chunk = self._proc.stdout.read(n - bytes_read)
+            if not chunk:
+                return b""
+            chunks.append(chunk)
+            bytes_read += len(chunk)
+        return b"".join(chunks)
+
+    def _reader_loop(self):
+        while not self._stop_event.is_set() and self._proc and self._proc.poll() is None:
+            data = self._read_exact(self.chunk_bytes)
+            if not data or len(data) < self.chunk_bytes:
+                break
+            try:
+                # Delivers identical signature to sounddevice RawInputStream:
+                # indata (bytes), frames, time_info, status
+                self.callback(data, self.blocksize, None, None)
+            except Exception:
+                pass
+
+        self.active = False
+        try:
+            if self._proc and self._proc.poll() is not None and not self._stop_event.is_set():
+                stderr_msg = ""
+                try:
+                    if self._proc.stderr:
+                        stderr_msg = self._proc.stderr.read().decode("utf-8", errors="replace").strip()
+                except Exception:
+                    pass
+                self.last_error = f"arecord terminated unexpectedly (code {self._proc.returncode}): {stderr_msg}"
+                if self.logger:
+                    self.logger.error(f"❌ [ARECORD ERROR] {self.last_error}")
+        except Exception:
+            pass
+
+    def stop(self):
+        self._stop_event.set()
+        self.active = False
+        if self._proc:
+            try:
+                self._proc.terminate()
+                self._proc.wait(timeout=0.5)
+            except Exception:
+                try:
+                    self._proc.kill()
+                except Exception:
+                    pass
+            self._proc = None
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=0.5)
+            self._thread = None
+
+    def close(self):
+        self.stop()
+
 
 
 def resample_16k_to_24k(raw_16k_bytes: bytes) -> bytes:
@@ -162,70 +314,7 @@ def find_audio_device(is_input: bool = True, preferred: str = "") -> tuple[Optio
     return valid[0][0], valid[0][1]
 
 
-try:
-    import usb.core
-    import usb.util
-    HAS_USB = True
-except ImportError:
-    HAS_USB = False
-
-RESPEAKER_VID = 0x2886
-RESPEAKER_PID = 0x0018
-PARAM_SPEECH_DETECTED = 19
-PARAM_DOA_ANGLE = 21
-
-
-class ReSpeakerHID:
-    """Hardware HID interface for ReSpeaker 4-Mic USB Array parameters (VAD & DOA)."""
-    TIMEOUT_MS = 1000
-
-    def __init__(self):
-        self.dev = None
-        self._last_find_attempt = 0.0
-        self._find_device()
-
-    def _find_device(self):
-        if not HAS_USB:
-            return
-        now = time.monotonic()
-        if (now - self._last_find_attempt) < 5.0:
-            return
-        self._last_find_attempt = now
-        try:
-            self.dev = usb.core.find(idVendor=RESPEAKER_VID, idProduct=RESPEAKER_PID)
-        except Exception:
-            self.dev = None
-
-    def _read_param(self, param_id: int) -> Optional[int]:
-        if self.dev is None:
-            self._find_device()
-            if self.dev is None:
-                return None
-        try:
-            data = self.dev.ctrl_transfer(
-                usb.util.CTRL_IN | usb.util.CTRL_TYPE_VENDOR | usb.util.CTRL_RECIPIENT_DEVICE,
-                0,
-                param_id,
-                0,
-                8,
-                self.TIMEOUT_MS,
-            )
-            if data and len(data) >= 4:
-                return struct.unpack_from("i", data, 0)[0]
-            return None
-        except Exception:
-            self.dev = None
-            return None
-
-    def speech_detected(self) -> Optional[bool]:
-        val = self._read_param(PARAM_SPEECH_DETECTED)
-        return (val == 1) if val is not None else None
-
-    def doa_angle(self) -> Optional[float]:
-        val = self._read_param(PARAM_DOA_ANGLE)
-        if val is not None and 0 <= val <= 359:
-            return float(val)
-        return None
+from astro_audio.respeaker_usb import ReSpeakerHID
 
 
 class AudioStreamNode(Node):
@@ -233,20 +322,47 @@ class AudioStreamNode(Node):
 
     def __init__(self):
         super().__init__("audio_stream_node")
+        if hasattr(self, "declare_parameter"):
+            try:
+                self.declare_parameter("input_channels", 0)
+                self.declare_parameter("enable_hid_doa", True)
+            except Exception:
+                pass
+
+        self.enable_hid_doa = True
+        if hasattr(self, "get_parameter"):
+            try:
+                p_val = self.get_parameter("enable_hid_doa").value
+                if p_val is not None:
+                    if isinstance(p_val, bool):
+                        self.enable_hid_doa = p_val
+                    elif isinstance(p_val, str):
+                        self.enable_hid_doa = p_val.strip().lower() in ("true", "1", "yes")
+                    else:
+                        self.enable_hid_doa = bool(p_val)
+            except Exception:
+                pass
 
         # Publishers
         self.pub_input_pcm = self.create_publisher(String, "/audio/realtime_input_pcm", 20)
         self.pub_playback_active = self.create_publisher(Bool, "/audio/playback_active", 10)
         self.pub_input_level = self.create_publisher(Float32, "/audio/mic_level", 10)
         self.pub_doa = self.create_publisher(Float32, "/audio/doa", 10)
+        # Bug #4 fix: companion confidence topic so social_gaze_node doesn't
+        # need to hardcode 0.85 — GCC-PHAT PSR confidence is preserved here.
+        self.pub_doa_confidence = self.create_publisher(Float32, "/audio/doa_confidence", 10)
         self.pub_vad = self.create_publisher(Bool, "/audio/vad", 10)
 
         # Hardware ReSpeaker HID & Acoustic DOA Estimator
-        self._respeaker = ReSpeakerHID()
+        self._respeaker = ReSpeakerHID() if self.enable_hid_doa else None
+        self._hid_status = None
         self._doa_estimator = AcousticDOAEstimator(sample_rate=HW_SAMPLE_RATE) if AcousticDOAEstimator else None
         self._capture_channels = 1
+        self._mic_channel_indices: tuple[int, ...] = (0, 1, 2, 3)
         self._last_doa_angle = 0.0
         self._last_mic_speech_time = 0.0
+        self._last_forensic_telemetry_time: float = 0.0
+        self._last_gcc_snapshot_time: float = 0.0
 
         # Subscribers
         self.create_subscription(String, "/audio/realtime_output_pcm", self._on_output_pcm, 50)
@@ -318,31 +434,51 @@ class AudioStreamNode(Node):
         self.create_timer(0.1, self._publish_status)
 
         # ReSpeaker 4-Mic HID DOA & VAD polling timer (10 Hz)
-        if not self._under_pytest():
+        if not self._under_pytest() and self.enable_hid_doa and self._respeaker is not None:
             self.create_timer(0.1, self._poll_respeaker_hid)
 
     def _poll_respeaker_hid(self):
         """Polls ReSpeaker 4-Mic hardware parameters (DOA & VAD) and publishes to ROS topics."""
-        if not self._respeaker or not self._respeaker.dev:
+        if self._respeaker is None:
             return
         try:
             is_speech = self._respeaker.speech_detected()
             doa_angle = self._respeaker.doa_angle()
-            now = time.monotonic()
-            recent_speech = (is_speech is True) or ((now - getattr(self, "_last_mic_speech_time", 0.0)) < 1.5)
+            status = "ok" if is_speech is not None and doa_angle is not None else self._respeaker.last_error or "Geçersiz USB DOA/VAD yanıtı"
+            if status != self._hid_status:
+                self._hid_status = status
+                if status == "ok":
+                    self.get_logger().info("ReSpeaker USB DOA/VAD okunuyor; /audio/doa ham montaj açısıdır.")
+                else:
+                    self.get_logger().warning(f"ReSpeaker DOA/VAD yok: {status}; USB bağlantısı ve udev izinlerini kontrol edin. Yeniden denenecek.")
 
-            if is_speech is not None:
-                vad_msg = Bool()
-                vad_msg.data = bool(is_speech)
-                self.pub_vad.publish(vad_msg)
+            is_active_playback = self._acoustic_playback_active()
+            vad_msg = Bool()
+            vad_msg.data = is_speech is True and not is_active_playback
+            self.pub_vad.publish(vad_msg)
 
-            # Publish genuine hardware DOA when speech occurred recently and angle is valid
-            if doa_angle is not None and recent_speech:
+            # Primary hardware DOA source from ReSpeaker HID (Float32 topic contract preserved)
+            if is_speech is True and doa_angle is not None and not is_active_playback:
                 doa_msg = Float32()
                 doa_msg.data = float(doa_angle)
                 self.pub_doa.publish(doa_msg)
+                # Politika güveni; ölçülmüş açısal doğruluk veya olasılık değildir.
+                hid_conf_msg = Float32()
+                hid_conf_msg.data = 0.60
+                self.pub_doa_confidence.publish(hid_conf_msg)
+
         except Exception as exc:
             self.get_logger().debug(f"_poll_respeaker_hid error: {exc}")
+
+    def _acoustic_playback_active(self) -> bool:
+        """Açık DAC sessiz kalabilir; gerçek oynatma, kuyruk ve yankı kuyruğu esas."""
+        now = time.monotonic()
+        return bool(
+            self._is_playing
+            or not self._play_queue.empty()
+            or now - self._last_playback_time < self.echo_mute_cooldown_s
+            or now - self._last_output_chunk_time < self.echo_mute_cooldown_s
+        )
 
     @staticmethod
     def _under_pytest() -> bool:
@@ -355,83 +491,258 @@ class AudioStreamNode(Node):
         )
 
     def _start_input_stream(self):
-        if sd is None:
-            self._input_stream_alive = False
-            self.get_logger().error("sounddevice kütüphanesi eksik! Canlı ses yakalanamıyor.")
-            self.get_logger().error(
-                f"[AUDIO ERROR]\n"
-                f"  direction=input\n"
-                f"  device=[{self._in_dev_idx}] {self._in_device_name}\n"
-                f"  reason=sounddevice_missing"
-            )
-            return
-
-        # Testler `sd`'yi mock'ladığında sorun yok — mock donanıma dokunmaz.
-        if self._under_pytest() and getattr(sd, "__name__", "") == "sounddevice":
+        # Under pytest/unit test, avoid touching physical audio hardware
+        if self._under_pytest():
             self._input_stream_alive = False
             self.get_logger().info("[TEST] Gerçek ses donanımı açılmadı (pytest).")
             return
 
-        try:
-            # Query hardware input channel count
-            max_in_ch = 1
+        # Ensure no existing input stream is holding ALSA pcmC0D0c in this process
+        if self._input_stream is not None:
             try:
-                dev_info = sd.query_devices(self._in_dev_idx) if (sd and self._in_dev_idx is not None) else {}
-                max_in_ch = dev_info.get("max_input_channels", 1) if isinstance(dev_info, dict) else 1
-            except Exception:
-                max_in_ch = 1
-
-            if max_in_ch >= 4 and any(h in self._in_device_name.lower() for h in RESPEAKER_NAME_HINTS):
-                self._capture_channels = 4
-            else:
-                self._capture_channels = 1
-
-            self._input_stream = sd.RawInputStream(
-                samplerate=HW_SAMPLE_RATE,
-                blocksize=HW_BLOCK_SIZE,
-                device=self._in_dev_idx,
-                channels=self._capture_channels,
-                dtype=DTYPE,
-                callback=self._input_callback,
-            )
-            self._input_stream.start()
-            self._input_stream_alive = True
-            self.get_logger().info(
-                f"🎛️ [DOA HARDWARE & CHANNEL CONFIG]\n"
-                f"  device_index={self._in_dev_idx} | device_name=\"{self._in_device_name}\"\n"
-                f"  channel_count={self._capture_channels} | hardware_max_channels={max_in_ch}\n"
-                f"  sample_rate={HW_SAMPLE_RATE} Hz | sample_format=int16 (16-bit PCM, 2 bytes/sample)\n"
-                f"  interleaving=interleaved [s0_ch0, s0_ch1, s0_ch2, s0_ch3, ...]\n"
-                f"  channel_mapping:\n"
-                f"    - Channel 0: Front Mic 0 (x=0.0m, y=+0.043m, 0 deg)\n"
-                f"    - Channel 1: Right Mic 1 (x=+0.043m, y=0.0m, +90 deg)\n"
-                f"    - Channel 2: Back Mic 2 (x=0.0m, y=-0.043m, 180 deg)\n"
-                f"    - Channel 3: Left Mic 3 (x=-0.043m, y=0.0m, -90 deg)\n"
-                f"  spatial_doa_engine=AcousticDOAEstimator (GCC-PHAT TDOA)"
-            )
-            self.get_logger().info(
-                f"🔊 [AUDIO READY]\n"
-                f"  input_device=[{self._in_dev_idx}] {self._in_device_name}\n"
-                f"  input_callback=alive\n"
-                f"  audio_input_callback_alive=True"
-            )
-        except Exception as e:
-            self._input_stream_alive = False
-            self.get_logger().warn(
-                f"[AUDIO ERROR]\n"
-                f"  direction=input\n"
-                f"  device=[{self._in_dev_idx}] {self._in_device_name}\n"
-                f"  reason=device_unavailable\n"
-                f"  error={e}"
-            )
-            # Subscribe to audio_capture_node's /audio/speech_audio as fallback input transport
-            try:
-                from std_msgs.msg import Int16MultiArray
-                self.sub_fallback_audio = self.create_subscription(
-                    Int16MultiArray, "/audio/speech_audio", self._on_fallback_audio_msg, 20
-                )
+                self._input_stream.stop()
+                self._input_stream.close()
             except Exception:
                 pass
+            self._input_stream = None
+            self._input_stream_alive = False
+
+        pref_in = os.getenv("AUDIO_INPUT_DEVICE", "")
+        alsa_target = pref_in if (pref_in.startswith("hw:") or pref_in.startswith("plughw:")) else RESPEAKER_ALSA_DEVICE
+
+        # Check candidate device:
+        # If candidate is pulse/default, or not a verified hardware ReSpeaker ("arrayuac"/"respeaker"),
+        # direct ALSA arecord MUST be chosen to avoid PortAudio capturing 0 RMS or locking pcmC0D0c.
+        in_name_lower = (self._in_device_name or "").lower()
+        is_pulse_or_default = any(h in in_name_lower for h in ("pulse", "default", "pipewire", "sysdefault"))
+        is_real_hw_respeaker = ("arrayuac" in in_name_lower) or ("respeaker" in in_name_lower)
+        prefer_arecord = (
+            pref_in.startswith("hw:")
+            or pref_in.startswith("plughw:")
+            or (sd is None)
+            or is_pulse_or_default
+            or (not is_real_hw_respeaker)
+            or sys.platform.startswith("linux")
+        )
+
+        arecord_err = ""
+        sd_err = ""
+
+        # Primary path: Direct ALSA arecord subprocess capture (sounddevice NOT opened)
+        if prefer_arecord:
+            self.get_logger().info(
+                f"🎙️ [AUDIO CAPTURE] Selecting direct ALSA arecord capture: {alsa_target} "
+                f"(PortAudio candidate='{self._in_device_name}')..."
+            )
+            param_val = 0
+            try:
+                if hasattr(self, "has_parameter") and self.has_parameter("input_channels"):
+                    param_val = int(self.get_parameter("input_channels").value)
+            except Exception:
+                param_val = 0
+            env_val = int(os.getenv("AUDIO_INPUT_CHANNELS", "0"))
+            pref_ch = param_val or env_val
+            self._capture_channels = pref_ch if pref_ch in (1, 2, 4, 6, 8) else 6
+            if self._capture_channels >= 6:
+                self._mic_channel_indices = (1, 2, 3, 4)
+            else:
+                self._mic_channel_indices = (0, 1, 2, 3)
+
+            arecord_stream = ArecordStream(
+                alsa_device=alsa_target,
+                channels=self._capture_channels,
+                rate=HW_SAMPLE_RATE,
+                blocksize=HW_BLOCK_SIZE,
+                callback=self._input_callback,
+                logger=self.get_logger(),
+            )
+            arecord_stream.start()
+
+            # If arecord succeeded, sounddevice input stream is NEVER opened!
+            if arecord_stream.active:
+                self._input_stream = arecord_stream
+                self._input_stream_alive = True
+                self._in_device_name = f"ALSA ({alsa_target}) [arecord]"
+                mic_map_str = (
+                    "    - Channel 0: Processed Mono (Beamformed / AEC)\n"
+                    "    - Channel 1: Front Mic 0 (0 deg)\n"
+                    "    - Channel 2: Right Mic 1 (+90 deg)\n"
+                    "    - Channel 3: Back Mic 2 (180 deg)\n"
+                    "    - Channel 4: Left Mic 3 (-90 / 270 deg)\n"
+                    "    - Channel 5: Playback Loopback"
+                    if self._capture_channels >= 6
+                    else
+                    "    - Channel 0: Front Mic 0 (0 deg)\n"
+                    "    - Channel 1: Right Mic 1 (+90 deg)\n"
+                    "    - Channel 2: Back Mic 2 (180 deg)\n"
+                    "    - Channel 3: Left Mic 3 (-90 / 270 deg)"
+                )
+                self.get_logger().info(
+                    f"🎛️ [DEVICE FORMAT FORENSICS - ALSA DIRECT]\n"
+                    f"  capture backend: arecord subprocess pipe\n"
+                    f"  ALSA device: {alsa_target}\n"
+                    f"  sample rate: {HW_SAMPLE_RATE} Hz\n"
+                    f"  sample format: int16 (S16_LE)\n"
+                    f"  channel count: {self._capture_channels}\n"
+                    f"  period/frame size: {HW_BLOCK_SIZE} samples ({(HW_BLOCK_SIZE / HW_SAMPLE_RATE) * 1000.0:.1f} ms)\n"
+                    f"  chunk bytes: {HW_BLOCK_SIZE * self._capture_channels * 2} bytes\n"
+                    f"  selected mic channels: {self._mic_channel_indices}\n"
+                    f"  channel mapping:\n{mic_map_str}\n"
+                    f"  spatial_doa_engine=ReSpeaker HID Hardware DOA + AcousticDOAEstimator"
+                )
+                self.get_logger().info(
+                    f"🔊 [AUDIO READY]\n"
+                    f"  input_device={self._in_device_name}\n"
+                    f"  input_callback=alive\n"
+                    f"  audio_input_callback_alive=True"
+                )
+                return
+            else:
+                arecord_err = arecord_stream.last_error
+                self.get_logger().warn(
+                    f"[AUDIO WARN] Direct ALSA arecord capture could not start ({arecord_err}). "
+                    f"Falling back to sounddevice / PortAudio path..."
+                )
+
+        # Secondary path: sounddevice RawInputStream
+        if sd is not None and self._in_dev_idx is not None:
+            try:
+                max_in_ch = 1
+                try:
+                    dev_info = sd.query_devices(self._in_dev_idx) if (sd and self._in_dev_idx is not None) else {}
+                    max_in_ch = dev_info.get("max_input_channels", 1) if isinstance(dev_info, dict) else 1
+                except Exception:
+                    max_in_ch = 1
+
+                param_val = 0
+                try:
+                    if hasattr(self, "has_parameter") and self.has_parameter("input_channels"):
+                        param_val = int(self.get_parameter("input_channels").value)
+                except Exception:
+                    param_val = 0
+                env_val = int(os.getenv("AUDIO_INPUT_CHANNELS", "0"))
+                pref_ch = param_val or env_val
+
+                if pref_ch in (1, 2, 4, 6, 8):
+                    self._capture_channels = pref_ch
+                elif max_in_ch >= 6:
+                    self._capture_channels = 6
+                elif max_in_ch >= 4:
+                    self._capture_channels = 4
+                else:
+                    self._capture_channels = 1
+
+                if self._capture_channels >= 6:
+                    self._mic_channel_indices = (1, 2, 3, 4)
+                else:
+                    self._mic_channel_indices = (0, 1, 2, 3)
+
+                self._input_stream = sd.RawInputStream(
+                    samplerate=HW_SAMPLE_RATE,
+                    blocksize=HW_BLOCK_SIZE,
+                    device=self._in_dev_idx,
+                    channels=self._capture_channels,
+                    dtype=DTYPE,
+                    callback=self._input_callback,
+                )
+                self._input_stream.start()
+                self._input_stream_alive = True
+
+                mic_map_str = (
+                    "    - Channel 0: Processed Mono (Beamformed / AEC)\n"
+                    "    - Channel 1: Front Mic 0 (0 deg)\n"
+                    "    - Channel 2: Right Mic 1 (+90 deg)\n"
+                    "    - Channel 3: Back Mic 2 (180 deg)\n"
+                    "    - Channel 4: Left Mic 3 (-90 / 270 deg)\n"
+                    "    - Channel 5: Playback Loopback"
+                    if self._capture_channels >= 6
+                    else
+                    "    - Channel 0: Front Mic 0 (0 deg)\n"
+                    "    - Channel 1: Right Mic 1 (+90 deg)\n"
+                    "    - Channel 2: Back Mic 2 (180 deg)\n"
+                    "    - Channel 3: Left Mic 3 (-90 / 270 deg)"
+                )
+                hostapi_info = "?"
+                if sd and isinstance(dev_info, dict) and "hostapi" in dev_info:
+                    try:
+                        hostapi_info = sd.query_hostapis(dev_info["hostapi"]).get("name", "?")
+                    except Exception:
+                        hostapi_info = str(dev_info.get("hostapi", "?"))
+
+                self.get_logger().info(
+                    f"🎛️ [DEVICE FORMAT FORENSICS - SOUNDDEVICE]\n"
+                    f"  ALSA device index: {self._in_dev_idx}\n"
+                    f"  detected USB device name: \"{self._in_device_name}\"\n"
+                    f"  hw/card: \"{dev_info.get('name', self._in_device_name) if isinstance(dev_info, dict) else self._in_device_name}\"\n"
+                    f"  host API: {hostapi_info}\n"
+                    f"  sample rate: {HW_SAMPLE_RATE} Hz\n"
+                    f"  sample format: int16 (16-bit signed PCM, 2 bytes/sample)\n"
+                    f"  channel count: {self._capture_channels} (hardware max: {max_in_ch})\n"
+                    f"  period/frame size: {HW_BLOCK_SIZE} samples ({(HW_BLOCK_SIZE / HW_SAMPLE_RATE) * 1000.0:.1f} ms)\n"
+                    f"  selected mic channels: {self._mic_channel_indices}\n"
+                    f"  channel mapping:\n{mic_map_str}\n"
+                    f"  spatial_doa_engine=ReSpeaker HID Hardware DOA + AcousticDOAEstimator"
+                )
+                self.get_logger().info(
+                    f"🔊 [AUDIO READY]\n"
+                    f"  input_device=[{self._in_dev_idx}] {self._in_device_name}\n"
+                    f"  input_callback=alive\n"
+                    f"  audio_input_callback_alive=True"
+                )
+                return
+            except Exception as e:
+                sd_err = str(e)
+                self.get_logger().warn(
+                    f"[AUDIO WARN] sounddevice capture failed on device [{self._in_dev_idx}] {self._in_device_name}: {e}"
+                )
+                if not prefer_arecord:
+                    self.get_logger().info(f"Attempting fallback direct ALSA arecord capture: {alsa_target}...")
+                    arecord_stream = ArecordStream(
+                        alsa_device=alsa_target,
+                        channels=self._capture_channels,
+                        rate=HW_SAMPLE_RATE,
+                        blocksize=HW_BLOCK_SIZE,
+                        callback=self._input_callback,
+                        logger=self.get_logger(),
+                    )
+                    arecord_stream.start()
+                    if arecord_stream.active:
+                        self._input_stream = arecord_stream
+                        self._input_stream_alive = True
+                        self._in_device_name = f"ALSA ({alsa_target}) [arecord fallback]"
+                        self.get_logger().info(
+                            f"🔊 [AUDIO READY]\n"
+                            f"  input_device={self._in_device_name}\n"
+                            f"  input_callback=alive\n"
+                            f"  audio_input_callback_alive=True"
+                        )
+                        return
+                    else:
+                        arecord_err = arecord_stream.last_error
+        else:
+            if sd is None:
+                sd_err = "sounddevice library is not installed"
+            elif self._in_dev_idx is None:
+                sd_err = "no valid sounddevice input device index"
+
+        # If both direct ALSA arecord and sounddevice failed:
+        self._input_stream_alive = False
+        self.get_logger().error(
+            f"❌ [AUDIO ERROR]\n"
+            f"  direction=input\n"
+            f"  device=[{self._in_dev_idx}] {self._in_device_name}\n"
+            f"  reason=capture_unavailable\n"
+            f"  arecord_error={arecord_err or 'not_run'}\n"
+            f"  sounddevice_error={sd_err or 'not_run'}"
+        )
+        # Subscribe to audio_capture_node's /audio/speech_audio as fallback input transport
+        try:
+            from std_msgs.msg import Int16MultiArray
+            self.sub_fallback_audio = self.create_subscription(
+                Int16MultiArray, "/audio/speech_audio", self._on_fallback_audio_msg, 20
+            )
+        except Exception:
+            pass
 
     def _on_fallback_audio_msg(self, msg):
         """Receives 16kHz int16 PCM from audio_capture_node when direct hardware capture is occupied."""
@@ -461,7 +772,19 @@ class AudioStreamNode(Node):
             raw_arr = np.frombuffer(raw_bytes, dtype=np.int16)
             if self._capture_channels >= 4 and len(raw_arr) >= (HW_BLOCK_SIZE * self._capture_channels):
                 multi_ch = raw_arr.reshape(-1, self._capture_channels).T  # Shape: (channels, frames)
-                arr = multi_ch[0]  # Front microphone for speech recognition
+                # On 6-channel ReSpeaker:
+                # ch0 is the XMOS DSP beamformed output, which heavily attenuates voice when off-axis.
+                # ch1 is the true physical Front Microphone (Mic 0, 0 deg).
+                # Default to ch1 (or AUDIO_SPEECH_CHANNEL override) for loud, unattenuated speech recognition.
+                if self._capture_channels >= 6:
+                    speech_ch = int(os.getenv("AUDIO_SPEECH_CHANNEL", "1"))
+                    if speech_ch >= multi_ch.shape[0]:
+                        speech_ch = 1
+                else:
+                    speech_ch = int(os.getenv("AUDIO_SPEECH_CHANNEL", "0"))
+                    if speech_ch >= multi_ch.shape[0]:
+                        speech_ch = 0
+                arr = multi_ch[speech_ch]
                 mono_raw_bytes = arr.tobytes()
             else:
                 multi_ch = None
@@ -478,11 +801,55 @@ class AudioStreamNode(Node):
                 rms = 0.0
                 peak = 0
 
-            is_active_playback = (
-                self._is_playing
-                or (now - self._last_playback_time < self.echo_mute_cooldown_s)
-                or (now - self._last_output_chunk_time < self.echo_mute_cooldown_s)
-            )
+            # STEP 2, 3, 5: RAW CHANNEL TELEMETRY & DISTINCTNESS FORENSICS (~1 Hz)
+            if multi_ch is not None and (now - getattr(self, "_last_forensic_telemetry_time", 0.0)) >= 1.0:
+                self._last_forensic_telemetry_time = now
+                num_ch = multi_ch.shape[0]
+
+                # STEP 2: Channel metrics (RMS, peak, mean, zero-crossing rate)
+                ch_lines = []
+                for c in range(num_ch):
+                    c_f = multi_ch[c].astype(np.float32)
+                    c_rms = float(np.sqrt(np.mean(c_f ** 2)))
+                    c_peak = int(np.max(np.abs(multi_ch[c])))
+                    c_mean = float(np.mean(c_f))
+                    c_zcr = float(np.mean(np.diff(np.signbit(c_f)) != 0)) if len(c_f) > 1 else 0.0
+                    ch_lines.append(f"  ch{c} rms={c_rms:7.1f} peak={c_peak:5d} mean={c_mean:+6.1f} zcr={c_zcr:.3f}")
+                ch_metrics_str = "\n".join(ch_lines)
+
+                # STEP 5: Channel distinctness normalized correlation among channels 1..4
+                if num_ch >= 5:
+                    def _norm_corr(x_arr: np.ndarray, y_arr: np.ndarray) -> float:
+                        xf = x_arr.astype(np.float32)
+                        yf = y_arr.astype(np.float32)
+                        xd = xf - np.mean(xf)
+                        yd = yf - np.mean(yf)
+                        denom = float(np.sqrt(np.sum(xd ** 2) * np.sum(yd ** 2)))
+                        return float(np.sum(xd * yd) / denom) if denom > 1e-6 else 0.0
+
+                    c12 = _norm_corr(multi_ch[1], multi_ch[2])
+                    c13 = _norm_corr(multi_ch[1], multi_ch[3])
+                    c14 = _norm_corr(multi_ch[1], multi_ch[4])
+                    c23 = _norm_corr(multi_ch[2], multi_ch[3])
+                    c24 = _norm_corr(multi_ch[2], multi_ch[4])
+                    c34 = _norm_corr(multi_ch[3], multi_ch[4])
+                    corr_str = (
+                        f"  corr(ch1,ch2)={c12:.4f} corr(ch1,ch3)={c13:.4f} corr(ch1,ch4)={c14:.4f}\n"
+                        f"  corr(ch2,ch3)={c23:.4f} corr(ch2,ch4)={c24:.4f} corr(ch3,ch4)={c34:.4f}"
+                    )
+                else:
+                    corr_str = "  (fewer than 5 channels available for 1..4 pair correlation)"
+
+                # STEP 3: Channel shape inspection
+                self.get_logger().info(
+                    f"[CHANNEL_SHAPE] pcm_shape={multi_ch.shape} capture_channels={self._capture_channels} selected_channels={getattr(self, '_mic_channel_indices', (0, 1, 2, 3))}\n"
+                    f"RAW_AUDIO:\n"
+                    f"{ch_metrics_str}\n"
+                    f"CHANNEL_CORRELATIONS:\n"
+                    f"{corr_str}"
+                )
+
+            is_active_playback = self._acoustic_playback_active()
 
             if not is_active_playback and rms < 400.0:
                 # Continuously adapt ambient background noise floor during quiet periods
@@ -490,15 +857,27 @@ class AudioStreamNode(Node):
             elif not is_active_playback and rms >= 400.0:
                 self._last_mic_speech_time = now
 
-            # Multi-Channel GCC-PHAT DOA Spatial Estimation on Raw Separate Channels
-            if multi_ch is not None and self._doa_estimator and not is_active_playback and rms >= 400.0:
-                azimuth_deg, conf, valid = self._doa_estimator.estimate_from_multichannel_pcm(multi_ch[:4])
-                if valid and azimuth_deg is not None:
-                    raw_doa = azimuth_deg if azimuth_deg >= 0.0 else azimuth_deg + 360.0
-                    doa_msg = Float32()
-                    doa_msg.data = float(raw_doa)
-                    self.pub_doa.publish(doa_msg)
-                    self.pub_vad.publish(Bool(data=True))
+            # Multi-Channel GCC-PHAT DOA Spatial Estimation (Primary high-precision acoustic tracking)
+            if multi_ch is not None and self._doa_estimator and not is_active_playback and rms >= 300.0:
+                mic_indices = getattr(self, "_mic_channel_indices", (0, 1, 2, 3))
+                if multi_ch.shape[0] > max(mic_indices):
+                    mics = multi_ch[list(mic_indices)]
+                else:
+                    mics = multi_ch[:4]
+
+                # STEP 7: GCC-PHAT INPUT SNAPSHOT (~1 Hz rate-limited)
+                if (now - getattr(self, "_last_gcc_snapshot_time", 0.0)) >= 1.0:
+                    self._last_gcc_snapshot_time = now
+                    mics_f = mics.astype(np.float32)
+                    mics_rms = [round(float(np.sqrt(np.mean(mics_f[i] ** 2))), 1) for i in range(mics.shape[0])]
+                    self.get_logger().info(
+                        f"[GCC_PHAT_SNAPSHOT]\n"
+                        f"  selected_pcm_shape={mics.shape}\n"
+                        f"  selected_channel_indices={list(mic_indices)}\n"
+                        f"  selected_channel_rms={mics_rms}"
+                    )
+
+                azimuth_deg, conf, valid = self._doa_estimator.estimate_from_multichannel_pcm(mics)
 
             # Software Echo Mute & Self-Voice Suppression (Zero Self-Hearing):
             if is_active_playback:
@@ -506,11 +885,31 @@ class AudioStreamNode(Node):
                 if self._playback_burst_active and burst_start > 0.0 and ((now - burst_start) * 1000.0 < self.barge_in_protection_ms):
                     return
 
-                # Adaptive barge-in threshold derived from ambient noise floor
-                adaptive_barge_in_rms = max(self.barge_in_min_rms, self._ambient_rms * self.barge_in_noise_mult)
+                # Target barge-in threshold during active playback: Requires intentional voice exceeding loudspeaker playback level
+                playback_barge_rms = float(getattr(self, "barge_in_playback_min_rms", 4500.0))
+                playback_barge_peak = int(getattr(self, "barge_in_playback_min_peak", 14000))
+                adaptive_barge_in_rms = max(playback_barge_rms, self._ambient_rms * self.barge_in_noise_mult)
+
+                # Channel correlation check: If all mic channels are highly correlated (internal speaker echo), suppress
+                if multi_ch is not None and multi_ch.shape[0] >= 5:
+                    def _corr(a: np.ndarray, b: np.ndarray) -> float:
+                        af = a.astype(np.float32) - float(np.mean(a))
+                        bf = b.astype(np.float32) - float(np.mean(b))
+                        d = float(np.sqrt(np.sum(af ** 2) * np.sum(bf ** 2)))
+                        return float(np.sum(af * bf) / d) if d > 1e-6 else 0.0
+
+                    c12 = _corr(multi_ch[1], multi_ch[2])
+                    c13 = _corr(multi_ch[1], multi_ch[3])
+                    c14 = _corr(multi_ch[1], multi_ch[4])
+                    if min(c12, c13, c14) >= 0.90:
+                        return
+                    if multi_ch.shape[0] >= 6:
+                        ch5_rms = float(np.sqrt(np.mean(multi_ch[5].astype(np.float32) ** 2)))
+                        if ch5_rms > 100.0 and _corr(multi_ch[speech_ch], multi_ch[5]) >= 0.70:
+                            return
 
                 # 2. Distinguish loud speech energy during active playback
-                is_genuine_barge_in = (rms >= adaptive_barge_in_rms and peak >= self.barge_in_min_peak)
+                is_genuine_barge_in = (rms >= adaptive_barge_in_rms and peak >= playback_barge_peak)
                 if not is_genuine_barge_in:
                     return
 
@@ -753,10 +1152,11 @@ class AudioStreamNode(Node):
                 if chunk and len(chunk) > 0:
                     t_w_start = time.perf_counter()
                     with self._playback_lock:
+                        # İlk blocking write sürerken de robot konuşuyor.
+                        self._is_playing = True
                         out_stream.write(chunk)
                     t_w_end = time.perf_counter()
 
-                    self._is_playing = True
                     self._last_playback_time = time.monotonic()
                     gen_played_bytes += len(chunk)
                     self._current_gen_played_bytes = gen_played_bytes
@@ -832,11 +1232,7 @@ class AudioStreamNode(Node):
 
     def _publish_status(self):
         msg = Bool()
-        msg.data = bool(
-            self._is_playing
-            or not self._play_queue.empty()
-            or (time.monotonic() - self._last_output_chunk_time) < self.echo_mute_cooldown_s
-        )
+        msg.data = self._acoustic_playback_active()
         self.pub_playback_active.publish(msg)
 
     def destroy_node(self):

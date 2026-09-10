@@ -33,8 +33,10 @@ except ImportError:
 
 try:
     from astro_vision.image_utils import bgr_to_imgmsg
+    from astro_vision.detection_quality import detect_faces_with_confidence
 except ImportError:
     from image_utils import bgr_to_imgmsg
+    from detection_quality import detect_faces_with_confidence
 
 
 class OakSpatialNativeNode(Node):
@@ -199,12 +201,12 @@ class OakSpatialNativeNode(Node):
                 scale_ratio = 320.0 / float(w) if w > 320 else 1.0
                 small_gray = cv2.resize(gray, (0, 0), fx=scale_ratio, fy=scale_ratio, interpolation=cv2.INTER_AREA) if scale_ratio < 1.0 else gray
 
-                detected_faces = face_cascade.detectMultiScale(
-                    small_gray, scaleFactor=1.1, minNeighbors=4,
+                detected_faces = detect_faces_with_confidence(
+                    face_cascade, small_gray, scaleFactor=1.1, minNeighbors=4,
                     minSize=(int(30 * scale_ratio), int(30 * scale_ratio))
                 )
 
-                faces = [[int(x / scale_ratio), int(y / scale_ratio), int(bw / scale_ratio), int(bh / scale_ratio)] for (x, y, bw, bh) in detected_faces] if scale_ratio < 1.0 else list(detected_faces)
+                faces = [[int(x / scale_ratio), int(y / scale_ratio), int(bw / scale_ratio), int(bh / scale_ratio), conf] for (x, y, bw, bh, conf) in detected_faces] if scale_ratio < 1.0 else [list(f) for f in detected_faces]
 
                 face_list = []
                 closest_dist = 0.0
@@ -212,7 +214,7 @@ class OakSpatialNativeNode(Node):
                 person_detected = len(faces) > 0
                 is_looking = False
 
-                for (x, y, bw, bh) in faces:
+                for (x, y, bw, bh, detection_conf) in faces:
                     # 1. 3D Depth Distance directly from OAK-D Hardware Stereo Depth
                     dist_m = 0.0
                     if depth_frame is not None:
@@ -257,6 +259,8 @@ class OakSpatialNativeNode(Node):
 
                     face_list.append({
                         "x": x, "y": y, "width": bw, "height": bh,
+                        "confidence": round(float(detection_conf), 2),
+                        "frame_width": int(w), "frame_height": int(h),
                         "spatial_x_m": round(float(spatial_x_m), 2),
                         "distance_m": round(float(dist_m), 2),
                         "yaw_deg": round(yaw_deg, 1),

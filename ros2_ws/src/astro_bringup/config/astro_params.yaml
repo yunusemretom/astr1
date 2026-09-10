@@ -1,6 +1,6 @@
 serial_bridge:
   ros__parameters:
-    port: "/dev/astro_arduino"
+    port: "/dev/ttyCH341USB0"
     baud: 115200
     connect_retry_sec: 2.0
     frame_id_imu: "imu_link"
@@ -8,6 +8,7 @@ serial_bridge:
     ticks_per_rev_right: 2048.0
     wheel_radius_left: 0.06
     wheel_radius_right: 0.06
+    head_angle_scale: 1.0  # Polarity fixed: ROS (+Left) -> Arduino (+Left)
 
 rplidar_node:
   ros__parameters:
@@ -75,12 +76,31 @@ head_tracker_node:
   ros__parameters:
     enabled: true
     doa_offset_deg: 0.0
-    doa_invert: false
-    max_yaw_deg: 70.0
-    min_yaw_deg: -70.0
-    deadband_deg: 12.0
+    doa_invert: true                # true (ReSpeaker Clockwise -> ROS Body CCW ters çevirme)
+    max_yaw_deg: 75.0               # Bounded ±75° joint envelope
+    min_yaw_deg: -75.0              # Bounded ±75° joint envelope
+    deadband_deg: 3.0
     min_dwell_time_s: 2.5
-    idle_return_timeout_s: 8.0
-    max_speed_deg_s: 45.0
-    min_rms_threshold: 800.0
-    noise_multiplier: 2.2
+    idle_return_timeout_s: 25.0
+    max_speed_deg_s: 75.0
+    min_rms_threshold: 400.0
+    head_motion_settle_s: 0.4
+    vision_fusion_enabled: true
+    vision_gain: 0.85
+    vision_timeout_s: 1.5
+
+social_gaze_node:
+  ros__parameters:
+    control_rate_hz: 50.0
+    max_velocity_deg_s: 75.0
+    max_acceleration_deg_s2: 180.0
+    max_jerk_deg_s3: 5400.0
+    gaze_deadband_deg: 2.5
+    min_attention_dwell_s: 2.50
+    turn_taking_min_dwell_s: 0.80
+    spatial_gate_deg: 25.0
+    idle_saccades_enabled: false
+    self_speech_suppression: true
+
+
+

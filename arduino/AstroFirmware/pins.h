@@ -30,8 +30,11 @@
 #define L_MOTOR_PWM_REV    6   // sol  LPWM  -> Timer4A
 #define R_MOTOR_PWM_FWD    9   // sag  RPWM  -> Timer2B
 #define R_MOTOR_PWM_REV   10   // sag  LPWM  -> Timer2A
-#define HEAD_MOTOR_PWM_FWD 44  // kafa RPWM  -> Timer5C
-#define HEAD_MOTOR_PWM_REV 45  // kafa LPWM  -> Timer5B
+#define HEAD_MOTOR_PWM_FWD 45  // kafa Sol/Pozitif PWM (CCW) -> Timer5B
+#define HEAD_MOTOR_PWM_REV 44  // kafa Sag/Negatif PWM (CW)  -> Timer5C
+
+
+
 
 // ─────────────────────────────────────────────────────────────
 //  Enkoderler - A kanallari kesme pininde, B kanallari yon icin okunur

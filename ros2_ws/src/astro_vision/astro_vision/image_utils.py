@@ -1,6 +1,12 @@
 """Image conversion without cv_bridge (avoids NumPy 2.x ABI issues on Jetson)."""
+import array
+
 import numpy as np
-from sensor_msgs.msg import Image
+try:
+    from sensor_msgs.msg import Image
+except ImportError:
+    class Image:
+        pass
 
 
 def imgmsg_to_bgr(msg: Image) -> np.ndarray:
@@ -29,5 +35,10 @@ def bgr_to_imgmsg(frame: np.ndarray, header) -> Image:
     msg.encoding = "bgr8"
     msg.is_bigendian = 0
     msg.step = int(frame.shape[1] * 3)
-    msg.data = frame.tobytes()
+    # array.array('B') is the one type rclpy's uint8[] setter accepts without
+    # inspecting it. Anything else — bytes included — is walked twice in pure Python
+    # (`all(isinstance(v, int) ...)` then `all(0 <= v < 256 ...)`) before being
+    # converted to exactly this, which cost 45 ms per 640x480 frame and throttled
+    # every vision node to a few Hz. The stored payload is identical either way.
+    msg.data = array.array("B", frame.tobytes())
     return msg

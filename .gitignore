@@ -23,3 +23,5 @@ Persons/
 # Çalışma zamanı hafızası (kişisel veri; tohum: astro_memory.seed.json)
 ros2_ws/astro_memory.json
 ros2_ws/astro_memory.json.bak
+*.db
+ros2_ws/data/

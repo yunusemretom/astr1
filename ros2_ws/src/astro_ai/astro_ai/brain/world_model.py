@@ -7,7 +7,7 @@ active people, spatial objects, conversational context, and recent events.
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from astro_ai.contracts.person_state import UnifiedPersonState
 from astro_ai.contracts.spatial_state import SpatialObjectState

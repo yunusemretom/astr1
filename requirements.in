@@ -32,6 +32,8 @@ requests                # ElevenLabs REST çağrıları
 # ── Ses yakalama ────────────────────────────────────────────
 sounddevice             # ReSpeaker mikrofon dizisi yakalama
 pyusb                   # ReSpeaker USB kontrol arayüzü
+scipy                   # standalone/voice.py resample_to: anti-alias polifaz
+                        # yeniden örnekleme (yoksa np.interp'e düşülür, bkz. o dosya)
 
 # ── Donanım / sayısal ───────────────────────────────────────
 pyserial                # Arduino Mega seri köprüsü

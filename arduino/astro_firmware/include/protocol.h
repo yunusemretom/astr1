@@ -36,7 +36,9 @@ namespace Proto {
     s.write(SOF2);
     s.write(len);
     s.write(msg_id);
-    if (payload_len > 0) s.write(payload, payload_len);
+    if (payload_len > 0 && payload != nullptr) {
+      s.write(payload, payload_len);
+    }
 
     uint8_t buf[1 + 255]; // length + data
     buf[0] = len;

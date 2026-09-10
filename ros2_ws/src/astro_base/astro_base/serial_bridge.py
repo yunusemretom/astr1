@@ -10,14 +10,87 @@ import struct
 import threading
 import time
 
-import rclpy
-import serial
-from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
-from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy
-from sensor_msgs.msg import Imu, JointState
+try:
+    import serial
+except ImportError:
+    serial = None
 
-from astro_base.msg import HeadCmd, WheelCmd
+try:
+    import rclpy
+    from rclpy.node import Node
+    from rclpy.qos import QoSProfile, ReliabilityPolicy
+    from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
+    from geometry_msgs.msg import Twist
+    from sensor_msgs.msg import Imu, JointState
+    from std_msgs.msg import Float32
+    from astro_base.msg import HeadCmd, WheelCmd
+    try:
+        from astro_base.msg import HeadState
+    except ImportError:
+        HeadState = None
+
+except ImportError:
+    class _MockRclpy:
+        @staticmethod
+        def ok():
+            return True
+        @staticmethod
+        def shutdown():
+            pass
+        @staticmethod
+        def init(*args, **kwargs):
+            pass
+    rclpy = _MockRclpy()  # type: ignore
+    class Node:  # type: ignore
+        def __init__(self, *args, **kwargs): pass
+        def get_logger(self):
+            import logging
+            return logging.getLogger("SerialBridge")
+        def declare_parameter(self, *args, **kwargs): pass
+        def get_parameter(self, name):
+            class _P:
+                value = 0.0
+                def get_parameter_value(self):
+                    class _PV:
+                        string_value = ""
+                        integer_value = 0
+                    return _PV()
+            return _P()
+        def create_publisher(self, *args, **kwargs): return None
+        def create_subscription(self, *args, **kwargs): return None
+        def create_timer(self, *args, **kwargs): return None
+    class QoSProfile:  # type: ignore
+        def __init__(self, *args, **kwargs): pass
+    class ReliabilityPolicy:  # type: ignore
+        BEST_EFFORT = 1
+    class HeadCmd:
+        angle_deg: float = 0.0
+    class WheelCmd:
+        left_rpm: float = 0.0
+        right_rpm: float = 0.0
+    class _MockHeader:
+        stamp = None
+        frame_id = ""
+    class DiagnosticArray:
+        def __init__(self):
+            self.header = _MockHeader()
+            self.status = []
+    class DiagnosticStatus:
+        OK = 0
+        WARN = 1
+        ERROR = 2
+        def __init__(self):
+            self.name = ""
+            self.hardware_id = ""
+            self.level = 0
+            self.message = ""
+            self.values = []
+    class KeyValue:
+        def __init__(self, key="", value=""):
+            self.key = str(key)
+            self.value = str(value)
+    Twist = Imu = JointState = Float32 = object
+
 
 SOF1 = 0xAA
 SOF2 = 0x55
@@ -68,24 +141,26 @@ class ArduinoState:
 
 def resolve_serial_port(primary: str = "/dev/astro_arduino", logger=None, baud: int = 115200) -> str:
     candidates = []
-    # 1. Primary rule
-    if primary and os.path.exists(primary):
+    # 1. Primary rule (if it's not a lidar port)
+    if primary and primary not in ("/dev/astro_lidar", "/dev/rplidar") and os.path.exists(primary):
         if logger:
             logger.info(f"[ARDUINO PORT DISCOVERY]\n  candidate={primary}\n  selected={primary}\n  baud={baud}")
         return primary
     elif primary:
         candidates.append(primary)
 
-    # 2. Search patterns in priority order
+    # 2. Search patterns in priority order (CH341 USB Arduino clone first, avoid lidar)
     search_patterns = [
-        "/dev/astro_*",
         "/dev/ttyCH341USB*",
+        "/dev/astro_arduino*",
         "/dev/ttyUSB*",
         "/dev/ttyACM*",
     ]
     for pattern in search_patterns:
         matched = sorted(glob.glob(pattern))
         for p in matched:
+            if p in ("/dev/astro_lidar", "/dev/rplidar"):
+                continue
             if p not in candidates:
                 candidates.append(p)
             if os.path.exists(p):
@@ -106,7 +181,7 @@ def resolve_serial_port(primary: str = "/dev/astro_arduino", logger=None, baud: 
 class SerialBridge(Node):
     def __init__(self):
         super().__init__("serial_bridge")
-        self.declare_parameter("port", "/dev/astro_arduino")
+        self.declare_parameter("port", "/dev/ttyCH341USB0")
         self.declare_parameter("baud", 115200)
         self.declare_parameter("connect_retry_sec", 2.0)
         self.declare_parameter("frame_id_imu", "imu_link")
@@ -114,9 +189,18 @@ class SerialBridge(Node):
         self.declare_parameter("ticks_per_rev_right", 2048.0)
         self.declare_parameter("wheel_radius_left", 0.06)
         self.declare_parameter("wheel_radius_right", 0.06)
+        self.declare_parameter("wheel_separation", 0.26)
+        self.declare_parameter("head_angle_scale", 1.0)
+        self.declare_parameter("head_ticks_per_deg", 2.5882)
+        self.declare_parameter("head_zero_offset_ticks", 0.0)
+        self.declare_parameter("head_sign", 1.0)
 
         self.port_param = self.get_parameter("port").get_parameter_value().string_value
-        self.baud = self.get_parameter("baud").get_parameter_value().integer_value
+        env_baud = os.getenv("ASTRO_SERIAL_BAUD")
+        if env_baud and env_baud.isdigit():
+            self.baud = int(env_baud)
+        else:
+            self.baud = self.get_parameter("baud").get_parameter_value().integer_value or 115200
         self.connect_retry_sec = float(self.get_parameter("connect_retry_sec").value)
 
         self.frame_id_imu = (
@@ -124,6 +208,13 @@ class SerialBridge(Node):
         )
         self.tpr_l = float(self.get_parameter("ticks_per_rev_left").value)
         self.tpr_r = float(self.get_parameter("ticks_per_rev_right").value)
+        self.wheel_radius_l = float(self.get_parameter("wheel_radius_left").value)
+        self.wheel_radius_r = float(self.get_parameter("wheel_radius_right").value)
+        self.wheel_separation = float(self.get_parameter("wheel_separation").value)
+        self.head_angle_scale = float(self.get_parameter("head_angle_scale").value)
+        self.head_ticks_per_deg = float(self.get_parameter("head_ticks_per_deg").value or 2.5882)
+        self.head_zero_offset_ticks = float(self.get_parameter("head_zero_offset_ticks").value or 0.0)
+        self.head_sign = float(self.get_parameter("head_sign").value or 1.0)
 
         qos_best_effort = QoSProfile(
             depth=10, reliability=ReliabilityPolicy.BEST_EFFORT
@@ -136,13 +227,34 @@ class SerialBridge(Node):
         self.pub_diag = self.create_publisher(
             DiagnosticArray, "/arduino/diagnostics", 10
         )
+        self.pub_std_diag = self.create_publisher(
+            DiagnosticArray, "/diagnostics", 10
+        )
+        if HeadState is not None:
+            self.pub_head_state = self.create_publisher(
+                HeadState, "/head/state", 10
+            )
+        else:
+            self.pub_head_state = None
 
         self.sub_wheel = self.create_subscription(
             WheelCmd, "/wheel_cmds", self.on_wheel_cmd, 10
         )
+        self.sub_cmd_vel = self.create_subscription(
+            Twist, "/cmd_vel", self.on_cmd_vel, 10
+        )
+        # Canonical Actuator Command Subscription (/head/command -> HeadCmd)
+        self.sub_head_command = self.create_subscription(
+            HeadCmd, "/head/command", self.on_head_cmd, 10
+        )
+        # Legacy compatibility subscriptions
         self.sub_head = self.create_subscription(
             HeadCmd, "/head_cmd", self.on_head_cmd, 10
         )
+        self.sub_head_pos = self.create_subscription(
+            Float32, "/head/cmd_pos", self.on_head_pos_cmd, 10
+        )
+
 
         self.state = ArduinoState.DISCONNECTED
         self.ser = None
@@ -155,6 +267,16 @@ class SerialBridge(Node):
         self.handshake_ok = False
         self._hb_seq = 0
         self.port_connected_time = 0.0
+
+        # Forensic RX Telemetry & Packet Counters
+        self._rx_bytes_total = 0
+        self._rx_bytes_window = 0
+        self._rx_fed_window = 0
+        self._last_rx_telemetry_time = 0.0
+        self._rx_count_enc = 0
+        self._rx_count_diag = 0
+        self._rx_count_imu = 0
+        self._rx_count_ack = 0
 
         self.left_pos = 0.0
         self.right_pos = 0.0
@@ -265,6 +387,14 @@ class SerialBridge(Node):
             return
 
         try:
+            # Linux'ta port acildiginda DTR reset darbesini ve Arduino resetlenmesini engelle
+            try:
+                if os.name != 'nt' and os.path.exists(port):
+                    import subprocess
+                    subprocess.run(["stty", "-F", port, "-hupcl"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+
             self.ser = serial.Serial(
                 port,
                 self.baud,
@@ -273,11 +403,28 @@ class SerialBridge(Node):
                 rtscts=False,
                 dsrdtr=False,
             )
-            try:
-                self.ser.reset_input_buffer()
-                self.ser.reset_output_buffer()
-            except Exception:
-                pass
+
+            # [FORENSIC DEBUG] Port parametrelerini doğrula
+            self.get_logger().info(
+                f"🔌 [SERIAL PORT PARAMS]\n"
+                f"  is_open={self.ser.is_open}\n"
+                f"  port={self.ser.port}\n"
+                f"  baudrate={self.ser.baudrate}\n"
+                f"  timeout={self.ser.timeout}\n"
+                f"  write_timeout={self.ser.write_timeout}\n"
+                f"  rtscts={self.ser.rtscts}\n"
+                f"  dsrdtr={self.ser.dsrdtr}"
+            )
+
+            # GEÇİCİ FORENSIC TEST: reset_input_buffer / reset_output_buffer çağrıları,
+            # Arduino DTR reset sonrası gelen ilk baytları temizleyip RX senkronizasyonunu
+            # etkileyip etkilemediğini test etmek için geçici olarak yoruma alındı.
+            # try:
+            #     self.ser.reset_input_buffer()
+            #     self.ser.reset_output_buffer()
+            # except Exception:
+            #     pass
+
             self.port = port
             self.port_connected_time = time.monotonic()
             self.last_hb_ack_time = time.monotonic()
@@ -289,6 +436,7 @@ class SerialBridge(Node):
             if self.rx_thread is None or not self.rx_thread.is_alive():
                 self.rx_thread = threading.Thread(target=self.read_loop, daemon=True)
                 self.rx_thread.start()
+                self.get_logger().info(f"[RX THREAD LAUNCHED] thread_name={self.rx_thread.name} alive={self.rx_thread.is_alive()}")
         except serial.SerialException as exc:
             self.get_logger().warn(f"Could not open {port}: {exc}. Retrying...")
             self.ser = None
@@ -304,8 +452,16 @@ class SerialBridge(Node):
         if self.ser is None or not self.ser.is_open:
             return
 
-        self._hb_seq = (self._hb_seq + 1) & 0xFFFFFFFF
         now_mono = time.monotonic()
+        time_since_connect = now_mono - getattr(self, "port_connected_time", 0.0)
+
+        # Bootloader Quiet Window:
+        # ATmega2560 DTR reset sonrasi ~1.8 saniye STK500 bootloader calistirir.
+        # Bu sure zarfinda UART TX yapilirsa STK500 sync loop'a girip user sketch'e gecemez.
+        if time_since_connect < 1.8:
+            return
+
+        self._hb_seq = (self._hb_seq + 1) & 0xFFFFFFFF
         if not hasattr(self, "_hb_tx_times"):
             self._hb_tx_times = {}
         self._hb_tx_times[self._hb_seq] = now_mono
@@ -392,96 +548,214 @@ class SerialBridge(Node):
             self.get_logger().error(f"WheelCmd write failed: {exc}")
             self._mark_disconnected()
 
+    def on_cmd_vel(self, msg: Twist):
+        """Converts standard differential drive Twist (m/s, rad/s) to WheelCmd (RPM)."""
+        v = float(msg.linear.x)
+        w = float(msg.angular.z)
+        v_left = v - (w * self.wheel_separation / 2.0)
+        v_right = v + (w * self.wheel_separation / 2.0)
+        left_rpm = (v_left / self.wheel_radius_l) * (60.0 / (2.0 * math.pi))
+        right_rpm = (v_right / self.wheel_radius_r) * (60.0 / (2.0 * math.pi))
+
+        wheel_cmd = WheelCmd()
+        wheel_cmd.left_rpm = float(left_rpm)
+        wheel_cmd.right_rpm = float(right_rpm)
+        self.on_wheel_cmd(wheel_cmd)
+
+    def on_head_pos_cmd(self, msg: Float32):
+        """Converts Float32 cmd_pos to HeadCmd for serial transmission."""
+        cmd = HeadCmd()
+        cmd.angle_deg = float(msg.data)
+        self.on_head_cmd(cmd)
+
     def on_head_cmd(self, msg: HeadCmd):
-        if self.ser is None or not self.ser.is_open:
+        if self.ser is None or not self.ser.is_open or not self.arduino_alive:
             return
 
-        payload = struct.pack("<f", msg.angle_deg)
+        now = time.monotonic()
+        scaled_angle = msg.angle_deg * getattr(self, "head_angle_scale", 1.0)
+        payload = struct.pack("<f", scaled_angle)
         pkt = self.build_packet(MSG_HEAD_CMD, payload)
         try:
             with self.tx_lock:
-                self.ser.write(pkt)
+                # Transmit binary MSG_HEAD_CMD packet on change >=0.5 deg (full resolution across -70° to +70°)
+                last_sent_angle = getattr(self, "_last_sent_angle", None)
+                if last_sent_angle is None or abs(msg.angle_deg - last_sent_angle) >= 0.5:
+                    self.ser.write(pkt)
+                    self._last_sent_angle = msg.angle_deg
+                    self._last_sent_angle_time = now
+                    self.get_logger().info(f"🎯 [SERIAL HEAD CMD] binary_pkt angle_deg={msg.angle_deg:.1f} (scaled={scaled_angle:.2f}°)")
         except serial.SerialException as exc:
             self.get_logger().error(f"HeadCmd write failed: {exc}")
             self._mark_disconnected()
 
-    def publish_imu(self, ax, ay, az, gx, gy, gz, micros_ts: int):
-        m = Imu()
+    def publish_imu(self, ax, ay, az, gx, gy, gz, micros_ts):
+        now = self.get_clock().now()
+        imu = Imu()
+        imu.header.stamp = now.to_msg()
+        imu.header.frame_id = self.frame_id_imu
 
-        if self.first_imu_sync:
-            self.time_offset_ns = self.get_clock().now().nanoseconds - (
-                micros_ts * 1000
-            )
-            self.first_imu_sync = False
+        imu.linear_acceleration.x = float(ax)
+        imu.linear_acceleration.y = float(ay)
+        imu.linear_acceleration.z = float(az)
 
-        stamp_ros_ns = (micros_ts * 1000) + self.time_offset_ns
-        m.header.stamp = rclpy.time.Time(nanoseconds=stamp_ros_ns).to_msg()
-        m.header.frame_id = self.frame_id_imu
-        m.linear_acceleration.x = ax
-        m.linear_acceleration.y = ay
-        m.linear_acceleration.z = az
-        m.angular_velocity.x = gx
-        m.angular_velocity.y = gy
-        m.angular_velocity.z = gz
-        m.linear_acceleration_covariance[0] = -1.0
-        m.angular_velocity_covariance[0] = -1.0
-        self.pub_imu.publish(m)
+        imu.angular_velocity.x = float(gx)
+        imu.angular_velocity.y = float(gy)
+        imu.angular_velocity.z = float(gz)
 
-    def publish_joint_states(self, dl: int, dr: int, dt_us: int):
-        del dt_us
-        dtheta_l = (dl / self.tpr_l) * 2.0 * math.pi
-        dtheta_r = (dr / self.tpr_r) * 2.0 * math.pi
-        self.left_pos = math.fsum([self.left_pos, dtheta_l])
-        self.right_pos = math.fsum([self.right_pos, dtheta_r])
+        imu.orientation.w = 1.0
+        imu.orientation.x = 0.0
+        imu.orientation.y = 0.0
+        imu.orientation.z = 0.0
+
+        imu.orientation_covariance[0] = -1.0
+        imu.linear_acceleration_covariance[0] = 0.01
+        imu.angular_velocity_covariance[0] = 0.001
+
+        self.pub_imu.publish(imu)
+
+    def publish_joint_states(self, left_ticks, right_ticks, dt_us, head_ticks=None):
+        now = self.get_clock().now()
+        dt_s = dt_us / 1e6
+
+        d_left = (left_ticks / self.tpr_l) * 2.0 * math.pi
+        d_right = (right_ticks / self.tpr_r) * 2.0 * math.pi
+
+        self.left_pos += d_left
+        self.right_pos += d_right
+
+        left_vel = d_left / dt_s if dt_s > 0 else 0.0
+        right_vel = d_right / dt_s if dt_s > 0 else 0.0
+
+        if head_ticks is not None:
+            # Canonical formula: position_deg = (sign * (head_ticks - zero_offset_ticks)) / ticks_per_head_degree
+            self.head_pos = (self.head_sign * (float(head_ticks) - self.head_zero_offset_ticks)) / self.head_ticks_per_deg
+            self.head_encoder_valid = True
+        else:
+            self.head_pos = float(getattr(self, "_last_sent_angle", 0.0))
+            self.head_encoder_valid = False
+
+        if not hasattr(self, "_last_head_pos_time"):
+            self._last_head_pos_time = time.monotonic()
+            self._last_head_pos = self.head_pos
+            self.head_vel = 0.0
+        else:
+            now_mono = time.monotonic()
+            dt_head = now_mono - self._last_head_pos_time
+            if dt_head >= 0.020:
+                raw_vel = (self.head_pos - self._last_head_pos) / dt_head
+                self.head_vel = 0.85 * self.head_vel + 0.15 * raw_vel
+                self._last_head_pos_time = now_mono
+                self._last_head_pos = self.head_pos
+
+        target_pos = float(getattr(self, "_last_sent_angle", 0.0))
+        is_moving = abs(self.head_vel) > 1.0
+        at_target = abs(self.head_pos - target_pos) <= 2.0 and not is_moving
 
         js = JointState()
-        js.header.stamp = self.get_clock().now().to_msg()
+        js.header.stamp = now.to_msg()
         js.name = ["left_wheel_joint", "right_wheel_joint", "head_yaw_joint"]
-        js.position = [self.left_pos, self.right_pos, float("nan")]
+        js.position = [self.left_pos, self.right_pos, math.radians(self.head_pos)]
+        js.velocity = [left_vel, right_vel, math.radians(self.head_vel)]
+        js.effort = [0.0, 0.0, 0.0]
         self.pub_js.publish(js)
 
-    def publish_diag(self, vbat_mV: int, temp_cX100: int, flags: int):
+        if self.pub_head_state is not None:
+            hs = HeadState()
+            hs.header.stamp = now.to_msg()
+            hs.header.frame_id = "head_link"
+            hs.position_deg = float(self.head_pos)
+            hs.velocity_deg_s = float(self.head_vel)
+            hs.target_position_deg = target_pos
+            hs.moving = is_moving
+            hs.at_target = at_target
+            hs.enabled = bool(getattr(self, "arduino_alive", False))
+            hs.watchdog_healthy = bool(getattr(self, "arduino_alive", False))
+            hs.encoder_valid = bool(self.head_encoder_valid)
+            hs.fault_code = 0
+            self.pub_head_state.publish(hs)
+
+
+    def publish_diag(self, vbat_mV, temp_cX100, flags):
+        now = self.get_clock().now()
         da = DiagnosticArray()
-        da.header.stamp = self.get_clock().now().to_msg()
+        da.header.stamp = now.to_msg()
+
         st = DiagnosticStatus()
-        st.name = "arduino"
-        st.hardware_id = "astro_arduino_mega"
-        st.level = DiagnosticStatus.OK
-        st.message = "OK"
+        st.name = "Arduino Base Controller"
+        st.hardware_id = "arduino_mega2560"
 
         if flags & 0x01:
-            st.level = DiagnosticStatus.WARN
-            st.message = "MOTORS_DISABLED_WATCHDOG"
-        if flags & 0x02:
             st.level = DiagnosticStatus.ERROR
-            st.message = "IMU_READ_FAIL"
+            st.message = "Watchdog timeout - motors halted"
+        elif flags & 0x02:
+            st.level = DiagnosticStatus.WARN
+            st.message = "IMU read failure"
+        else:
+            st.level = DiagnosticStatus.OK
+            st.message = "OK"
 
         st.values = [
-            KeyValue(key="vbat_mV", value=str(vbat_mV)),
-            KeyValue(key="mcu_temp_c", value=str(temp_cX100 / 100.0)),
+            KeyValue(key="vbat_V", value=f"{vbat_mV / 1000.0:.2f}"),
+            KeyValue(key="temp_C", value=f"{temp_cX100 / 100.0:.2f}"),
             KeyValue(key="flags", value=hex(flags)),
             KeyValue(key="arduino_alive", value=str(self.arduino_alive)),
             KeyValue(key="port", value=str(self.port or "disconnected")),
         ]
         da.status = [st]
         self.pub_diag.publish(da)
+        if hasattr(self, "pub_std_diag") and self.pub_std_diag:
+            self.pub_std_diag.publish(da)
 
     def read_loop(self):
+        self.get_logger().info("🚀 [SERIAL RX THREAD STARTED]")
         state = 0
         expected_len = 0
         buf = bytearray()
+
         while rclpy.ok():
             if self.ser is None or not self.ser.is_open:
                 time.sleep(0.1)
                 continue
 
             try:
-                in_waiting = self.ser.in_waiting or 1
-                chunk = self.ser.read(in_waiting)
+                in_waiting = getattr(self.ser, "in_waiting", 0)
+                now_mono = time.monotonic()
+
+                # Periyodik telemetri logu (DEBUG seviyesinde, log spam yapmaz)
+                if now_mono - self._last_rx_telemetry_time >= 5.0:
+                    dt = max(0.001, now_mono - self._last_rx_telemetry_time)
+                    rate_bps = self._rx_bytes_window / dt
+                    self.get_logger().debug(
+                        f"[SERIAL RX TELEMETRY 5s]\n"
+                        f"  port_open={self.ser.is_open if self.ser else False}\n"
+                        f"  device={self.port}\n"
+                        f"  in_waiting={in_waiting}\n"
+                        f"  rx_rate={rate_bps:.1f} B/s (window={self._rx_bytes_window}B in {dt:.2f}s, total={self._rx_bytes_total}B)\n"
+                        f"  bytes_fed_5s={self._rx_fed_window}\n"
+                        f"  parser_state: state={state} exp_len={expected_len} buf_len={len(buf)}\n"
+                        f"  parsed_total: enc={self._rx_count_enc} diag={self._rx_count_diag} imu={self._rx_count_imu} ack={self._rx_count_ack}"
+                    )
+                    self._last_rx_telemetry_time = now_mono
+                    self._rx_bytes_window = 0
+                    self._rx_fed_window = 0
+
+                if in_waiting > 0:
+                    chunk = self.ser.read(in_waiting)
+                else:
+                    chunk = self.ser.read(1)
+
                 if not chunk:
                     continue
 
-                self.get_logger().debug(f"[SERIAL RX RAW] bytes={len(chunk)} hex={chunk[:16].hex()}")
+                chunk_len = len(chunk)
+                self._rx_bytes_total += chunk_len
+                self._rx_bytes_window += chunk_len
+                self._rx_fed_window += chunk_len
+
+                self.get_logger().debug(
+                    f"[RAW SERIAL RX] bytes={chunk_len} in_waiting={in_waiting} hex_64={chunk[:64].hex()}"
+                )
 
                 for b in chunk:
                     if state == 0:
@@ -506,34 +780,44 @@ class SerialBridge(Node):
                         body = bytes([expected_len]) + bytes(buf)
                         c = crc8(body)
                         msg_id = buf[0] if buf else 0
-                        if c == b or msg_id == MSG_HEARTBEAT_ACK:
+                        if c == b:
                             payload = bytes(buf[1:])
                             self.handle_msg(msg_id, payload)
                             state = 0
                         else:
                             state = 1 if b == SOF1 else 0
             except serial.SerialException as exc:
-                self.get_logger().error(f"Serial read error: {exc}")
+                self.get_logger().error(f"[SERIAL RX ERROR] SerialException: {exc}")
                 self._mark_disconnected()
+                time.sleep(0.5)
+            except Exception as exc:
+                self.get_logger().error(f"[SERIAL RX THREAD EXCEPTION] Unexpected error: {exc}")
                 time.sleep(0.5)
 
     def handle_msg(self, msg_id: int, payload: bytes):
         if msg_id == MSG_IMU_DATA:
+            self._rx_count_imu += 1
             if len(payload) != 6 * 4 + 4:
                 return
             ax, ay, az, gx, gy, gz, micros_ts = struct.unpack("<ffffffI", payload)
             self.publish_imu(ax, ay, az, gx, gy, gz, micros_ts)
         elif msg_id == MSG_ENCODER_TICKS:
-            if len(payload) != 12:
-                return
-            l, r, dt_us = struct.unpack("<iiI", payload)
-            self.publish_joint_states(l, r, dt_us)
+            self._rx_count_enc += 1
+            if len(payload) == 16:
+                l, r, head_ticks, dt_us = struct.unpack("<iiiI", payload)
+                self.publish_joint_states(l, r, dt_us, head_ticks=head_ticks)
+            elif len(payload) == 12:
+                l, r, dt_us = struct.unpack("<iiI", payload)
+                self.publish_joint_states(l, r, dt_us, head_ticks=None)
+
         elif msg_id == MSG_DIAGNOSTICS:
+            self._rx_count_diag += 1
             if len(payload) != 8:
                 return
             vbat_mV, temp_cX100, flags = struct.unpack("<HhI", payload)
             self.publish_diag(vbat_mV, temp_cX100, flags)
         elif msg_id == MSG_HEARTBEAT_ACK:
+            self._rx_count_ack += 1
             now_mono = time.monotonic()
             ack_seq = getattr(self, "_hb_seq", 0)
             if len(payload) >= 4:
@@ -550,17 +834,26 @@ class SerialBridge(Node):
             lat_ms = (now_mono - tx_time) * 1000.0 if tx_time > 0 else 5.0
             seq_match = (ack_seq == getattr(self, "_hb_seq", 0) or ack_seq > 0)
 
-            self.get_logger().info(
-                f"[HEARTBEAT ACK RX]\n"
-                f"seq={ack_seq}\n"
-                f"timestamp={now_mono:.3f}\n"
-                f"payload={payload.hex()}\n"
-                f"crc_valid=true\n"
-                f"sequence_match={'true' if seq_match else 'false'}"
-            )
-
             prev_alive = getattr(self, "arduino_alive", False)
             prev_handshake = getattr(self, "handshake_ok", False)
+
+            # Only log multi-line ACK block on initial handshake, recovery, or periodically (every 10s)
+            last_logged_ack = getattr(self, "_last_logged_ack_time", 0.0)
+            if not prev_alive or not prev_handshake or (now_mono - last_logged_ack) >= 10.0:
+                self._last_logged_ack_time = now_mono
+                self.get_logger().info(
+                    f"[HEARTBEAT ACK RX]\n"
+                    f"seq={ack_seq}\n"
+                    f"timestamp={now_mono:.3f}\n"
+                    f"payload={payload.hex()}\n"
+                    f"crc_valid=true\n"
+                    f"sequence_match={'true' if seq_match else 'false'}"
+                )
+            else:
+                self.get_logger().debug(
+                    f"[HEARTBEAT ACK RX] seq={ack_seq} latency_ms={lat_ms:.1f}"
+                )
+
             self.last_hb_ack_time = now_mono
             self.arduino_alive = True
             self.handshake_ok = True
@@ -569,6 +862,18 @@ class SerialBridge(Node):
             if not prev_handshake:
                 self.get_logger().info("[ARDUINO HANDSHAKE] status=success")
                 self.get_logger().info("heartbeat_healthy=true\nmotor_safety_gate=open")
+                # Başlangıçta kafa açısını 0.0° (Home/Merkez) ve tekerlekleri 0 RPM'e kesin olarak hizala
+                try:
+                    head_zero_pkt = self.build_packet(MSG_HEAD_CMD, struct.pack("<f", 0.0))
+                    wheel_zero_pkt = self.build_packet(MSG_WHEEL_CMD, struct.pack("<ff", 0.0, 0.0))
+                    with self.tx_lock:
+                        if self.ser and self.ser.is_open:
+                            self.ser.write(head_zero_pkt)
+                            self.ser.write(wheel_zero_pkt)
+                    self._last_sent_angle = 0.0
+                    self.get_logger().info("🎯 [HEAD HOMING] Başlangıç kafa konumu 0.0° (Center) olarak hizalandı.")
+                except Exception as exc:
+                    self.get_logger().debug(f"Initial zero homing command error: {exc}")
 
             if not prev_alive:
                 self.get_logger().info(f"[HEARTBEAT ACK] sequence={ack_seq} latency_ms={lat_ms:.1f} status=healthy")

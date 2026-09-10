@@ -1,0 +1,79 @@
+# ASTRO Social Robot Gaze & Multimodal Speaker Tracking Parameters
+# Comprehensive tuning configuration for all perception, fusion, gaze, and motion layers.
+
+/**:
+  ros__parameters:
+    control_rate_hz: 50.0
+    max_velocity_deg_s: 75.0
+    max_acceleration_deg_s2: 180.0
+    max_jerk_deg_s3: 5400.0
+    gaze_deadband_deg: 3.0
+    min_attention_dwell_s: 2.50
+    turn_taking_min_dwell_s: 0.80
+    spatial_gate_deg: 25.0
+    idle_saccades_enabled: false
+    self_speech_suppression: true
+    verbose_diagnostics: false
+
+    audio:
+      sample_rate_hz: 16000
+      frame_size_samples: 960       # 60 ms audio frame at 16 kHz
+      min_rms_energy: 350.0         # Acoustic energy floor threshold (int16 RMS)
+      vad_threshold: 450.0          # Dynamic VAD voice activity threshold
+      min_confidence: 0.40          # Minimum PSR confidence to accept raw DOA
+      outlier_max_jump_deg: 35.0    # Angular jump threshold for single-frame outlier rejection
+      outlier_persistence_count: 3  # Consecutive frames required to confirm real movement
+      median_filter_window: 5       # Circular median filter order (must be odd)
+      kalman_process_noise_q: 0.08  # Process noise variance for angle & velocity
+      kalman_measurement_noise_r: 0.45 # Measurement noise variance
+      self_speech_suppression_factor: 0.15 # Multiplier applied to audio confidence when robot is speaking
+      motion_max_sens_velocity_deg_s: 40.0 # Velocity at which audio confidence decays towards zero
+      motion_settle_time_s: 0.45    # Quiet settling window after head movement before full audio sensitivity
+
+    vision:
+      min_confidence: 0.50          # Face/person detection minimum confidence
+      track_coasting_timeout_s: 0.70 # Time to coast missing visual track before marking LOST
+      hungarian_gating_distance_m: 0.85 # Maximum 3D metric distance to associate detection to track
+      direct_gaze_max_yaw_deg: 22.0 # Maximum user head yaw to be considered direct eye contact
+      social_zone_min_dist_m: 0.35  # Minimum interaction distance (meters)
+      social_zone_max_dist_m: 3.50  # Maximum interaction distance (meters)
+
+    fusion:
+      spatial_association_gate_deg: 25.0 # Maximum angular difference to fuse audio & visual target
+      audio_freshness_half_life_s: 0.80  # Freshness decay half-life for sound
+      vision_freshness_half_life_s: 1.20 # Freshness decay half-life for visual tracks
+      audio_weight_base: 0.40       # Weight factor for audio modality
+      vision_weight_base: 0.85      # Weight factor for vision modality
+      fallback_enabled: false       # Support automatic fallback to Audio-Only or Vision-Only
+
+    target_manager:
+      acquisition_threshold: 0.75   # Confidence required to acquire and lock a new target
+      hold_threshold: 0.40          # Confidence threshold below which target drops to coasting
+      target_lost_timeout_s: 2.5    # Duration in coasting before removing target
+      min_attention_dwell_s: 2.50   # Minimum gaze dwell time before switching targets
+      turn_taking_min_dwell_s: 0.80 # Accelerated dwell time when a new distinct speaker takes floor
+      turn_taking_min_angle_deg: 20.0 # Angular separation to qualify for turn-taking switch
+      max_tracked_candidates: 6     # Maximum simultaneous candidate tracks maintained
+
+    gaze_manager:
+      deadband_deg: 3.0             # Angular error deadband (no motor command below this)
+      idle_return_timeout_s: 25.0   # Silence/inactivity timeout before returning head to 0.0° center
+      idle_saccades_enabled: false  # Enable natural gentle social micro-saccades during idle
+      idle_saccade_interval_s: 8.0  # Interval between idle subtle breathing saccades
+      idle_saccade_max_deg: 4.5     # Amplitude of idle subtle saccades
+
+    motion_planner:
+      profile_type: "s_curve"       # "s_curve" (jerk-limited) or "trapezoidal"
+      max_velocity_deg_s: 75.0      # Maximum head pan velocity (°/s)
+      max_acceleration_deg_s2: 180.0 # Maximum head pan acceleration (°/s²)
+      max_jerk_deg_s3: 5400.0        # Maximum head pan jerk (°/s³)
+      soft_landing_zone_deg: 12.0   # Deceleration zone near target for smooth arrival
+      control_loop_hz: 50.0         # Trajectory generator interpolation frequency
+
+    controller:
+      serial_port: "/dev/ttyCH341USB0"
+      serial_baud: 115200
+      heartbeat_rate_hz: 10.0       # Host heartbeat rate
+      watchdog_timeout_s: 0.50      # Motor shutdown timeout if heartbeat lost
+      stall_timeout_s: 1.50         # Motor stall detection timeout
+

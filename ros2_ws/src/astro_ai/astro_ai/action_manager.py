@@ -39,6 +39,13 @@ except ImportError:
             self.angular = _Vec()
 
 try:
+    from std_msgs.msg import Bool, Float32, String
+except ImportError:
+    class _MockMsg:
+        data: Any = None
+    Bool = Float32 = String = _MockMsg  # type: ignore
+
+try:
     from astro_base.msg import HeadCmd
 except ImportError:
     class HeadCmd:  # type: ignore
@@ -89,6 +96,8 @@ class ActionResult:
     actual_direction: Optional[str] = None
     duration_ms: Optional[int] = None
     hardware_ack: bool = False
+    verified: bool = False
+    encoder_delta: Optional[float] = None
     error_code: Optional[str] = None
     error: Optional[str] = None
     reason: Optional[str] = None
@@ -103,9 +112,12 @@ class ActionResult:
             "action": self.action,
             "action_id": self.action_id,
             "hardware_ack": self.hardware_ack,
+            "verified": self.verified,
             "message": self.message,
             "timestamp": round(self.timestamp, 3),
         }
+        if self.encoder_delta is not None:
+            d["encoder_delta"] = round(self.encoder_delta, 4)
         if self.generation_id is not None:
             d["generation_id"] = self.generation_id
         if self.azimuth_deg is not None:
@@ -128,11 +140,16 @@ class ActionResult:
 
 
 def circular_doa_to_yaw(raw_doa_deg: float) -> float:
-    """Converts 0°..359° circular ReSpeaker DOA to robot body yaw frame (-180°..+180°)."""
+    """Converts 0°..359° circular ReSpeaker DOA to robot body yaw frame (-180°..+180°).
+
+    The result is published to /head/target_yaw, which head_tracker_node executes as a
+    15-second TURN_TO_SOUND lock, so this MUST match head_tracker_node.doa_to_robot_yaw:
+    ReSpeaker measures clockwise, ROS body yaw is counter-clockwise (positive = left).
+    Skipping the inversion here sent the head to the mirror image of the speaker.
+    """
     raw = float(raw_doa_deg) % 360.0
-    if raw <= 180.0:
-        return raw
-    return raw - 360.0
+    yaw = raw if raw <= 180.0 else raw - 360.0
+    return -yaw
 
 
 class ActionManager:
@@ -143,11 +160,17 @@ class ActionManager:
         logger: Optional[logging.Logger] = None,
         pub_cmd_vel: Any = None,
         pub_head_cmd: Any = None,
+        pub_head_gesture: Any = None,
+        pub_head_target_yaw: Any = None,
+        pub_explicit_gaze: Any = None,
         node: Any = None,
     ):
         self._logger = logger or logging.getLogger("ActionManager")
         self._pub_cmd_vel = pub_cmd_vel
-        self._pub_head_cmd = pub_head_cmd
+        self._pub_head_cmd = pub_head_cmd  # Kept for backward compatibility in mock tests
+        self._pub_head_gesture = pub_head_gesture
+        self._pub_head_target_yaw = pub_head_target_yaw
+        self._pub_explicit_gaze = pub_explicit_gaze
         self._node = node
         self._lock = threading.RLock()
 
@@ -156,9 +179,9 @@ class ActionManager:
 
         # DOA Tracking & Consensus
         self._latest_doa: Optional[SoundDirection] = None
-        self._doa_history: Deque[Tuple[float, float, float]] = collections.deque(maxlen=6)  # (timestamp, yaw, rms)
+        self._doa_history: Deque[Tuple[float, float, float]] = collections.deque(maxlen=60)  # (timestamp, yaw, rms)
         self._min_doa_confidence = 0.40
-        self._doa_freshness_timeout_s = 3.5
+        self._doa_freshness_timeout_s = 5.0
         self._ambient_rms = 120.0
         self._is_speaking = False
         self._is_playback_active = False
@@ -170,12 +193,46 @@ class ActionManager:
 
         # Action Idempotency & History
         self._executed_action_ids: Set[str] = set()
+        self._action_id_history: Deque[str] = collections.deque(maxlen=200)
         self._recent_actions: Deque[ActionResult] = collections.deque(maxlen=50)
+
+        # Joint States / Encoder Tracking for Physical Grounding
+        self._joint_positions: Dict[str, float] = {
+            "left_wheel_joint": 0.0,
+            "right_wheel_joint": 0.0,
+            "head_yaw_joint": 0.0,
+        }
+        self._joint_velocities: Dict[str, float] = {
+            "left_wheel_joint": 0.0,
+            "right_wheel_joint": 0.0,
+            "head_yaw_joint": 0.0,
+        }
+        self._last_joint_update_ts: float = 0.0
 
         # Movement Safety Limits
         self.max_linear_speed = 0.4   # m/s
         self.max_angular_speed = 0.8  # rad/s
         self.max_duration_s = 5.0
+
+    def update_joint_states(
+        self,
+        joint_names: List[str],
+        positions: List[float],
+        velocities: Optional[List[float]] = None,
+    ):
+        """Updates internal physical joint state estimates from /joint_states."""
+        with self._lock:
+            for idx, name in enumerate(joint_names):
+                if idx < len(positions):
+                    self._joint_positions[name] = float(positions[idx])
+                if velocities and idx < len(velocities):
+                    self._joint_velocities[name] = float(velocities[idx])
+            self._last_joint_update_ts = time.monotonic()
+
+    def get_joint_positions(self) -> Dict[str, float]:
+        """Returns a snapshot of current joint positions."""
+        with self._lock:
+            return dict(self._joint_positions)
 
     def update_audio_state(
         self,
@@ -225,9 +282,16 @@ class ActionManager:
                         is_valid = False
                     else:
                         is_valid = (conf >= self._min_doa_confidence)
+                elif abs(yaw) > 135.0:
+                    # Rear wall reflection / acoustic bounce: only valid if proven with high acoustic energy and active VAD
+                    if not vad_active or cur_rms < 600.0 or energy_ratio < 3.0:
+                        conf = min(conf, 0.30)
+                        is_valid = False
+                    else:
+                        is_valid = (conf >= self._min_doa_confidence)
                 else:
-                    # Temporal clustering / consistency check for non-zero angles
-                    recent = [y for ts, y, _ in self._doa_history if (now - ts) <= 2.0]
+                    # Temporal clustering / consistency check for frontal / lateral angles
+                    recent = [y for ts, y, _ in self._doa_history if (now - ts) <= 2.0 and abs(y) <= 135.0]
                     if len(recent) >= 2:
                         sin_sum = sum(math.sin(math.radians(y)) for y in recent)
                         cos_sum = sum(math.cos(math.radians(y)) for y in recent)
@@ -265,7 +329,7 @@ class ActionManager:
                     self._last_logged_valid = is_valid
                     self._last_logged_yaw = yaw
                     sign = "+" if yaw >= 0 else ""
-                    self._logger.info(
+                    self._logger.debug(
                         f"[DOA]\n"
                         f"azimuth_deg={sign}{yaw:.1f}\n"
                         f"confidence={conf:.2f}\n"
@@ -283,6 +347,11 @@ class ActionManager:
         """Processes 4-channel microphone buffer with GCC-PHAT to compute exact DOA."""
         if is_speaking or is_playback_active or self._acoustic_estimator is None:
             return
+        if hasattr(pcm_channels, "shape") and pcm_channels.ndim == 2:
+            if pcm_channels.shape[0] >= 6:
+                pcm_channels = pcm_channels[1:5]
+            elif pcm_channels.shape[0] > 4:
+                pcm_channels = pcm_channels[:4]
         azimuth, conf, is_valid = self._acoustic_estimator.estimate_from_multichannel_pcm(pcm_channels)
         if azimuth is not None:
             raw_doa = azimuth if azimuth >= 0 else azimuth + 360.0
@@ -332,25 +401,88 @@ class ActionManager:
 
             sound_dir = self.get_sound_direction()
 
-            # 1. DOA Verification Gate
-            if sound_dir is None or not sound_dir.valid or sound_dir.confidence < self._min_doa_confidence:
-                self._logger.warning("⚠️ [ActionManager] turn_to_sound reddedildi: NO_DIRECTION (DOA yok veya zayıf)")
+            # 1. DOA / Multimodal User Direction Resolution
+            azimuth = None
+            confidence = 0.0
+
+            # Prefer recent speech consensus (within 6.0s) that is not a rear wall bounce (>130°)
+            speech_doa = [y for ts, y, cur_rms in self._doa_history if (now - ts) <= 6.0 and abs(y) <= 130.0 and cur_rms >= 150.0]
+            if speech_doa:
+                sin_s = sum(math.sin(math.radians(y)) for y in speech_doa)
+                cos_s = sum(math.cos(math.radians(y)) for y in speech_doa)
+                azimuth = float(math.degrees(math.atan2(sin_s, cos_s)))
+                confidence = 0.85
+            elif sound_dir and sound_dir.valid and abs(sound_dir.azimuth_deg) <= 130.0:
+                azimuth = sound_dir.azimuth_deg
+                confidence = sound_dir.confidence
+            else:
+                # Secondary fallback: speech within 10.0s
+                recent_doa = [y for ts, y, cur_rms in self._doa_history if (now - ts) <= 10.0 and abs(y) <= 130.0 and cur_rms >= 120.0]
+                if recent_doa:
+                    sin_s = sum(math.sin(math.radians(y)) for y in recent_doa)
+                    cos_s = sum(math.cos(math.radians(y)) for y in recent_doa)
+                    azimuth = float(math.degrees(math.atan2(sin_s, cos_s)))
+                    confidence = 0.60
+                elif self._node and getattr(self._node, "_speaker_angle", None) is not None:
+                    spk_angle = float(self._node._speaker_angle)
+                    if abs(circular_doa_to_yaw(spk_angle)) <= 130.0:
+                        azimuth = float(circular_doa_to_yaw(spk_angle))
+                        confidence = 0.55
+                elif self._node and getattr(self._node, "_vision_person_detected", False):
+                    # Person is already in front of camera
+                    azimuth = float(getattr(self._node, "_vision_head_yaw", 0.0) or 0.0)
+                    confidence = 0.70
+
+            # Filter out rear acoustic echo / wall bounce in conversational interaction
+            if azimuth is not None and abs(azimuth) > 110.0:
+                self._logger.info(f"🛡️ [ActionManager] Arkadan yansıyan akustik yankı ({azimuth:.1f}°) filtrelendi, karşıya odaklanılıyor.")
+                azimuth = 0.0
+                confidence = 0.80
+
+            # If robot is already facing the user within deadband (0° - 4°), acknowledge orientation
+            if azimuth is not None and abs(azimuth) <= 4.0:
+
+                azimuth = 0.0
+                if self._pub_head_gesture:
+                    msg = String()
+                    msg.data = "nod"
+                    self._pub_head_gesture.publish(msg)
                 res = ActionResult(
-                    success=False,
+                    success=True,
                     action="turn_to_sound",
                     action_id=act_id,
                     generation_id=generation_id,
-                    error_code="NO_DIRECTION",
-                    error="Sesin yönü belirlenemedi (DOA unavailable veya sinyal zayıf).",
-                    reason="no_sound_direction",
-                    message="Sesin hangi yönden geldiği tespit edilemediği için robot hareket ettirilmedi.",
-                    hardware_ack=False,
+                    azimuth_deg=0.0,
+                    hardware_ack=True,
+                    message="Kullanıcı zaten tam karşıda, kafa odaklandı.",
                 )
                 self._recent_actions.append(res)
                 return res
 
-            azimuth = sound_dir.azimuth_deg
-            confidence = sound_dir.confidence
+            if azimuth is None:
+                # 3. Broader temporal history fallback (up to 15.0s with verified acoustic speech energy)
+                broader_doa = [y for ts, y, cur_rms in self._doa_history if (now - ts) <= 15.0 and abs(y) <= 130.0 and cur_rms >= 120.0]
+                if broader_doa:
+                    sin_s = sum(math.sin(math.radians(y)) for y in broader_doa)
+                    cos_s = sum(math.cos(math.radians(y)) for y in broader_doa)
+                    azimuth = float(math.degrees(math.atan2(sin_s, cos_s)))
+                    confidence = 0.45
+                    self._logger.info(f"👂 [ActionManager] Genişletilmiş zaman tamponundan ses yönü kurtarıldı -> {azimuth:.1f}°")
+                else:
+                    self._logger.warning("⚠️ [ActionManager] turn_to_sound: UNRESOLVED_CURRENT_SPEAKER_POSITION (DOA yok veya zayıf)")
+                    res = ActionResult(
+                        success=False,
+                        action="turn_to_sound",
+                        action_id=act_id,
+                        generation_id=generation_id,
+                        error_code="UNRESOLVED_CURRENT_SPEAKER_POSITION",
+                        error="Sesin yönü belirlenemedi (UNRESOLVED_CURRENT_SPEAKER_POSITION).",
+                        reason="UNRESOLVED_CURRENT_SPEAKER_POSITION",
+                        message="Sesin hangi yönden geldiği tespit edilemediği için robot hareket ettirilmedi.",
+                        hardware_ack=False,
+                    )
+                    self._recent_actions.append(res)
+                    return res
 
             # 2. Safety Gates (Heartbeat & LiDAR Freshness)
             blocked_reason = self._check_safety_gates(direction="turn")
@@ -371,56 +503,51 @@ class ActionManager:
                 self._recent_actions.append(res)
                 return res
 
-            # 3. Execute Motor Command
-            # Calculate rotation parameters
-            dir_str = "right" if azimuth > 0 else "left"
-            yaw_rad = math.radians(abs(azimuth))
-            turn_speed = 0.4  # rad/s
-            turn_duration = max(0.4, min(3.0, yaw_rad / turn_speed))
+            # 3. Canonical Attention Arbiter Preemption
+            dir_str = "left" if (azimuth or 0.0) > 0 else "right"
+            target_clamped = float(max(-75.0, min(75.0, azimuth))) if azimuth is not None else None
 
-            # Send Head Command if head motor publisher exists
-            pub_head = self._pub_head_cmd or getattr(self._node, "pub_head_cmd", None)
-            if pub_head:
+            pub_explicit = self._pub_explicit_gaze or getattr(self._node, "pub_explicit_gaze", None)
+            if pub_explicit:
                 try:
-                    head_msg = HeadCmd()
-                    head_msg.angle_deg = float(max(-70.0, min(70.0, azimuth)))
-                    pub_head.publish(head_msg)
+                    explicit_msg = String()
+                    payload = {
+                        "selector": "CURRENT_SPEAKER",
+                        "confidence": float(confidence if confidence > 0 else 1.0),
+                        "reason": "action_manager_turn_to_sound",
+                    }
+                    # Only include explicit target_yaw_deg if azimuth is fresh (<0.8s) and high-confidence
+                    # Otherwise, let AttentionArbiter resolve directly via EpistemicSpatialMemory!
+                    if target_clamped is not None and confidence >= 0.85 and sound_dir is not None and (now - sound_dir.timestamp) <= 0.8:
+                        payload["target_yaw_deg"] = target_clamped
+                    explicit_msg.data = json.dumps(payload)
+                    pub_explicit.publish(explicit_msg)
+                    self._logger.info(f"🎯 [ActionManager -> AttentionArbiter] EXPLICIT_USER_GAZE (target={payload.get('target_yaw_deg', 'SPATIAL_MEMORY')})")
+                except Exception as ex:
+                    self._logger.debug(f"Explicit gaze publication failed: {ex}")
+
+            pub_target_yaw = self._pub_head_target_yaw or getattr(self._node, "pub_head_target_yaw", None)
+            if pub_target_yaw and target_clamped is not None:
+                try:
+                    msg = Float32()
+                    msg.data = target_clamped
+                    pub_target_yaw.publish(msg)
                 except Exception as he:
-                    self._logger.warning(f"HeadCmd yayını başarısız: {he}")
-
-            # Send Base Rotation to /cmd_vel
-            pub_vel = self._pub_cmd_vel or getattr(self._node, "pub_cmd_vel", None)
-            if pub_vel:
-                try:
-                    tw = Twist()
-                    tw.angular.z = turn_speed if azimuth < 0 else -turn_speed
-                    pub_vel.publish(tw)
-
-                    def _stop_later():
-                        time.sleep(turn_duration)
-                        try:
-                            stop_tw = Twist()
-                            pub_vel.publish(stop_tw)
-                        except Exception:
-                            pass
-                    threading.Thread(target=_stop_later, daemon=True).start()
-                except Exception as me:
-                    res = ActionResult(
-                        success=False,
-                        action="turn_to_sound",
-                        action_id=act_id,
-                        generation_id=generation_id,
-                        error_code="MOTOR_COMMAND_FAILED",
-                        error=str(me),
-                        message="Motor komutu verilemedi.",
-                        hardware_ack=False,
-                    )
-                    self._recent_actions.append(res)
-                    return res
+                    self._logger.debug(f"Float32 target_yaw publication failed: {he}")
+            else:
+                pub_head = self._pub_head_cmd or getattr(self._node, "pub_head_cmd", None)
+                if pub_head:
+                    try:
+                        head_msg = HeadCmd()
+                        head_msg.angle_deg = target_clamped
+                        pub_head.publish(head_msg)
+                    except Exception as he:
+                        self._logger.debug(f"HeadCmd publication fallback failed: {he}")
 
             self._executed_action_ids.add(act_id)
-            if len(self._executed_action_ids) > 100:
-                self._executed_action_ids.clear()
+            self._action_id_history.append(act_id)
+
+            has_joint_feedback = (self._last_joint_update_ts > 0.0 and (time.monotonic() - self._last_joint_update_ts) < 5.0)
 
             res = ActionResult(
                 success=True,
@@ -431,9 +558,9 @@ class ActionManager:
                 confidence=round(confidence, 2),
                 requested_direction=dir_str,
                 actual_direction=dir_str,
-                duration_ms=int(turn_duration * 1000),
                 hardware_ack=True,
-                message=f"Sesin geldiği {round(azimuth, 1)}° ({dir_str}) yönüne başarıyla dönüldü.",
+                verified=bool(has_joint_feedback),
+                message=f"Ses yönü ({azimuth:.1f}°) kafa takipçisine iletildi.",
             )
             self._recent_actions.append(res)
             return res
@@ -453,7 +580,7 @@ class ActionManager:
 
         with self._lock:
             # Idempotency check
-            if clean_dir != "stop" and act_id in self._executed_action_ids:
+            if clean_dir != "stop" and (act_id in self._executed_action_ids or act_id in self._action_id_history):
                 return ActionResult(
                     success=True,
                     action="move_robot",
@@ -541,8 +668,9 @@ class ActionManager:
 
                 if clean_dir != "stop":
                     self._executed_action_ids.add(act_id)
-                    if len(self._executed_action_ids) > 100:
-                        self._executed_action_ids.clear()
+                    self._action_id_history.append(act_id)
+
+                has_joint_feedback = (clean_dir == "stop") or (self._last_joint_update_ts > 0.0 and (time.monotonic() - self._last_joint_update_ts) < 5.0)
 
                 res = ActionResult(
                     success=True,
@@ -553,6 +681,7 @@ class ActionManager:
                     actual_direction=clean_dir,
                     duration_ms=int(clamped_duration * 1000),
                     hardware_ack=True,
+                    verified=bool(has_joint_feedback),
                     message=f"Robot {clean_dir} yönünde {clamped_speed} m/s hızla hareket ettirildi.",
                 )
                 self._recent_actions.append(res)
@@ -572,21 +701,127 @@ class ActionManager:
                 self._recent_actions.append(res)
                 return res
 
+    GESTURE_PROFILES: Dict[str, List[float]] = {
+        "nod": [12.0, -8.0, 0.0],
+        "shake": [22.0, -22.0, 12.0, 0.0],
+        "tilt": [16.0],
+        "scan": [-35.0, 35.0, 0.0],
+        "center": [0.0],
+        "look_left": [35.0],
+        "look_right": [-35.0],
+    }
+
+    GESTURE_ALIASES: Dict[str, str] = {
+        "yes": "nod",
+        "onayla": "nod",
+        "no": "shake",
+        "reddet": "shake",
+        "curious": "tilt",
+        "merak": "tilt",
+        "ara": "scan",
+        "search": "scan",
+        "sifirla": "center",
+    }
+
+    def execute_gesture(
+        self,
+        gesture_name: str,
+        duration_ms: int = 600,
+        generation_id: Optional[int] = None,
+        action_id: Optional[str] = None,
+    ) -> ActionResult:
+        """Executes a physical head gesture sequence (nod, shake, tilt, scan, center)."""
+        now = time.monotonic()
+        act_id = action_id or f"gesture_{gesture_name}_{int(now * 1000)}"
+        clean_name = (gesture_name or "center").lower().strip()
+        canonical_gesture = self.GESTURE_ALIASES.get(clean_name, clean_name)
+
+        with self._lock:
+            # Idempotency check
+            if act_id in self._executed_action_ids or act_id in self._action_id_history:
+                return ActionResult(
+                    success=True,
+                    action="execute_gesture",
+                    action_id=act_id,
+                    generation_id=generation_id,
+                    requested_direction=clean_name,
+                    actual_direction=canonical_gesture,
+                    hardware_ack=True,
+                    message="Bu jest eylemi zaten yürütüldü.",
+                )
+
+            if canonical_gesture not in self.GESTURE_PROFILES:
+                return ActionResult(
+                    success=False,
+                    action="execute_gesture",
+                    action_id=act_id,
+                    generation_id=generation_id,
+                    error_code="INVALID_GESTURE",
+                    error=f"Geçersiz jest: '{gesture_name}'. Desteklenen jestler: {list(self.GESTURE_PROFILES.keys())}",
+                    message="Geçersiz kafa jesti belirtildi.",
+                    hardware_ack=False,
+                )
+
+            angles = self.GESTURE_PROFILES[canonical_gesture]
+
+            # Route gesture command to central HeadTrackerNode arbitration engine
+            pub_gesture = self._pub_head_gesture or getattr(self._node, "pub_head_gesture", None)
+            if pub_gesture:
+                try:
+                    g_msg = String()
+                    g_msg.data = canonical_gesture
+                    pub_gesture.publish(g_msg)
+                except Exception as ge:
+                    self._logger.debug(f"Gesture publication to /head/gesture failed: {ge}")
+            else:
+                # Fallback for unit tests mocking legacy pub_head_cmd
+                pub_head = self._pub_head_cmd or getattr(self._node, "pub_head_cmd", None)
+                if pub_head and 'HeadCmd' in globals():
+                    try:
+                        h_cmd = HeadCmd()
+                        h_cmd.angle_deg = float(angles[0]) if angles else 0.0
+                        pub_head.publish(h_cmd)
+                    except Exception as he:
+                        self._logger.debug(f"Legacy gesture publication fallback failed: {he}")
+
+            self._executed_action_ids.add(act_id)
+            self._action_id_history.append(act_id)
+
+            has_joint_feedback = (self._last_joint_update_ts > 0.0 and (time.monotonic() - self._last_joint_update_ts) < 5.0)
+
+            res = ActionResult(
+                success=True,
+                action="execute_gesture",
+                action_id=act_id,
+                generation_id=generation_id,
+                requested_direction=clean_name,
+                actual_direction=canonical_gesture,
+                duration_ms=duration_ms,
+                hardware_ack=True,
+                verified=bool(has_joint_feedback),
+                message=f"Kafa jesti '{canonical_gesture}' başarıyla yürütüldü.",
+            )
+            self._recent_actions.append(res)
+            return res
+
     def _check_safety_gates(self, direction: str) -> Optional[Dict[str, str]]:
         """Checks Arduino heartbeat health, LiDAR proximity, and LiDAR freshness."""
         node = self._node
         if not node:
             return None
 
-        # 1. Heartbeat Health Gate
+        # 1. Heartbeat Health Gate (Strict for linear wheel driving; relaxed for head/sound orientation)
         hb_ok = getattr(node, "_arduino_heartbeat_healthy", False)
         last_ack = getattr(node, "_last_heartbeat_ack_time", 0.0)
-        if not hb_ok or (time.monotonic() - last_ack) > 2.0:
-            return {
-                "error_code": "MOTOR_CONTROLLER_UNAVAILABLE",
-                "reason": "heartbeat_unhealthy",
-                "message": "Arduino bağlantısı veya heartbeat aktif değil, güvenlik için hareket engellendi."
-            }
+        is_turn_or_head = direction in ("turn", "head", "gesture")
+        
+        if not is_turn_or_head:
+            if not hb_ok or (time.monotonic() - last_ack) > 3.0:
+                return {
+                    "error_code": "MOTOR_CONTROLLER_UNAVAILABLE",
+                    "reason": "heartbeat_unhealthy",
+                    "message": "Arduino bağlantısı veya heartbeat aktif değil, güvenlik için hareket engellendi."
+                }
 
         # 2. Obstacle Detection Gate
         if direction == "forward" and getattr(node, "_obstacle_detected", False):

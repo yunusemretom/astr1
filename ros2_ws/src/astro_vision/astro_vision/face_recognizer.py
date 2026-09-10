@@ -244,7 +244,6 @@ class FaceRecognizer:
         engine = _get_engine()
         if engine is not None:
             try:
-                engine.load()
                 matched_name, sim = engine.identify(face_bgr)
                 if matched_name is not None and sim >= threshold:
                     norm = self._normalize_name(matched_name)

@@ -12,7 +12,13 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, GroupAction, IncludeLaunchDescription, LogInfo
+from launch.actions import (
+    DeclareLaunchArgument,
+    GroupAction,
+    IncludeLaunchDescription,
+    LogInfo,
+    SetEnvironmentVariable,
+)
 from launch.conditions import IfCondition, UnlessCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PythonExpression
@@ -65,6 +71,14 @@ def generate_launch_description():
     use_native_spatial = LaunchConfiguration("use_native_spatial")
 
     return LaunchDescription([
+        # Bir 640x480 bgr8 kare 900 KB; Linux'un varsayılan 208 KB'lık UDP alım
+        # tamponu tek kareyi bile tutamıyor ve FastDDS parçaladığı mesajın çoğunu
+        # düşürüyordu (yayıncı 30 Hz, dedektör 5.8 Hz — %70 kayıp). Paylaşımlı bellek
+        # taşıması bunu aynı makinede tamamen ortadan kaldırır; UDP dışarısı için açık kalır.
+        SetEnvironmentVariable(
+            "FASTRTPS_DEFAULT_PROFILES_FILE",
+            os.path.join(pkg_dir, "config", "fastdds_shm.xml"),
+        ),
         DeclareLaunchArgument(
             "use_sim_time", default_value="false", description="Use simulation clock"
         ),
@@ -77,6 +91,11 @@ def generate_launch_description():
             "use_native_spatial",
             default_value="false",
             description="OAK-D VPU üzerinde çalışan yerleşik uzamsal algı boru hattı",
+        ),
+        DeclareLaunchArgument(
+            "show_debug",
+            default_value="false",
+            description="Canlı bounding box penceresi göster (cv2.imshow)",
         ),
 
         # --- Görüntü kaynakları ---
@@ -96,7 +115,7 @@ def generate_launch_description():
             executable="face_detector_node",
             name="face_detector_node",
             output="screen",
-            parameters=[params_file, {"use_sim_time": use_sim_time}],
+            parameters=[params_file, {"use_sim_time": use_sim_time, "show_debug": LaunchConfiguration("show_debug")}],
             condition=UnlessCondition(use_native_spatial),
         ),
         Node(

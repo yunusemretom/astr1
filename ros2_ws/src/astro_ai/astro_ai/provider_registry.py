@@ -114,20 +114,26 @@ GROQ_PREFERENCE_ORDER: List[str] = [
 ]
 
 GEMINI_PRODUCTION_MODELS: Set[str] = {
-    "gemini-2.0-flash",
-    "gemini-1.5-flash",
-    "gemini-1.5-pro",
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
     "gemini-2.5-pro",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+    "gemini-1.5-pro",
+    "gemini-2.0-flash-lite",
 }
 
 GEMINI_PREFERENCE_ORDER: List[str] = [
-    "gemini-2.0-flash",
-    "gemini-1.5-flash",
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
+    "gemini-2.5-pro",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+    "gemini-2.0-flash-lite",
+    "gemini-1.5-pro",
 ]
+
+
 
 OPENAI_PRODUCTION_MODELS: Set[str] = {
     "gpt-4o-mini",
@@ -446,6 +452,7 @@ class ProviderRegistry:
                 data = json.loads(resp.read().decode("utf-8"))
                 raw_models = data.get("models", [])
 
+            has_25_family = any("2.5" in item.get("name", "") for item in raw_models)
             active_ids = []
 
             for item in raw_models:
@@ -462,13 +469,15 @@ class ProviderRegistry:
                 if any(x in m_id.lower() for x in ("-image", "image-", "imagen")):
                     self._rejected_models["gemini"][m_id] = "image_generation_model"
                     continue
-                if any(x in m_id.lower() for x in ("gemini-1.5", "1.5")):
+                if any(x in m_id.lower() for x in ("gemini-1.5", "1.5")) and has_25_family:
                     self._rejected_models["gemini"][m_id] = "deprecated_or_legacy_family"
                     continue
                 if any(x in m_id.lower() for x in ("embedding", "aqa", "imagen", "tts", "stt")):
                     self._rejected_models["gemini"][m_id] = "non_chat_modality"
                     continue
-                if any(x in m_id.lower() for x in ("bison", "chat-bison", "learnlm")):
+
+
+                if any(x in m_id.lower() for x in ("bison", "chat-bison", "learnlm", "gemini-1.0")):
                     self._rejected_models["gemini"][m_id] = "legacy_deprecated_family"
                     continue
                 if any(x in m_id.lower() for x in ("experimental", "preview-")):
@@ -744,24 +753,42 @@ class ProviderRegistry:
             method="POST",
         )
 
+        t_start = time.monotonic()
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
+                latency_ms = (time.monotonic() - t_start) * 1000.0
                 res_json = json.loads(resp.read().decode("utf-8"))
                 candidates = res_json.get("candidates", [])
+                text_out = ""
                 if candidates:
                     parts = candidates[0].get("content", {}).get("parts", [])
                     if parts:
-                        return parts[0].get("text", "").strip()
-                return ""
+                        text_out = parts[0].get("text", "").strip()
+                self._log(
+                    "info",
+                    f"⚡ [LLM CALL] provider=gemini model={model_id} mode=generateContent endpoint=generativelanguage.googleapis.com latency_ms={latency_ms:.1f} status=200 error=none"
+                )
+                return text_out
         except urllib.error.HTTPError as http_e:
+            latency_ms = (time.monotonic() - t_start) * 1000.0
             err_body = http_e.read().decode("utf-8", errors="ignore")
             err_class = self.classify_error(http_e.code, err_body, http_e)
             self.record_error("gemini", model_id, err_class, err_body)
+            self._log(
+                "warn" if err_class in (ErrorClass.QUOTA_EXHAUSTED, ErrorClass.RATE_LIMITED) else "error",
+                f"⚠️ [LLM CALL ERROR] provider=gemini model={model_id} mode=generateContent endpoint=generativelanguage.googleapis.com latency_ms={latency_ms:.1f} status={http_e.code} error_class={err_class.value} reason={err_body[:100]}"
+            )
             raise ProviderError("gemini", model_id, err_class, err_body, http_e.code)
         except Exception as ge:
+            latency_ms = (time.monotonic() - t_start) * 1000.0
             err_class = self.classify_error(0, str(ge), ge)
             self.record_error("gemini", model_id, err_class, str(ge))
+            self._log(
+                "error",
+                f"⛔ [LLM CALL ERROR] provider=gemini model={model_id} mode=generateContent endpoint=generativelanguage.googleapis.com latency_ms={latency_ms:.1f} status=0 error_class={err_class.value} reason={str(ge)[:100]}"
+            )
             raise ProviderError("gemini", model_id, err_class, str(ge))
+
 
 
 def _cli_discover():

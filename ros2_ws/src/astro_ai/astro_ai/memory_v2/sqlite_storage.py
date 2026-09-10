@@ -21,6 +21,8 @@ class SQLiteMemoryStorage:
             data_dir = os.path.abspath(os.path.join(here, "..", "..", "..", "..", "data"))
             os.makedirs(data_dir, exist_ok=True)
             self.db_path = os.path.join(data_dir, "astro_cognitive.db")
+        elif db_path == ":memory:":
+            self.db_path = ":memory:"
         else:
             self.db_path = os.path.abspath(db_path)
             os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
@@ -33,8 +35,9 @@ class SQLiteMemoryStorage:
         if not hasattr(self._local, "conn") or self._local.conn is None:
             conn = sqlite3.connect(self.db_path, timeout=10.0)
             conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA journal_mode = WAL;")
-            conn.execute("PRAGMA synchronous = NORMAL;")
+            if self.db_path != ":memory:":
+                conn.execute("PRAGMA journal_mode = WAL;")
+                conn.execute("PRAGMA synchronous = NORMAL;")
             conn.execute("PRAGMA foreign_keys = ON;")
             self._local.conn = conn
         return self._local.conn

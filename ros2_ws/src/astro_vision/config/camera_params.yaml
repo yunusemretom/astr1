@@ -20,18 +20,19 @@ webcam_publisher_node:
     output_topic: "/oak/rgb/image_raw"
     width: 640
     height: 480
-    fps: 15.0
+    # Kameranın kendi hızı. 30 FPS'lik sensörü 15 Hz'de okumak yükü yarıya indirmez;
+    # sürücünün 4 karelik kuyruğunu doldurup orada bırakır — read() 0.26 ms'de döner
+    # ama kare ~133 ms bayattır. Takip, kişinin bulunduğu yeri değil geçtiği yeri kovalar.
+    fps: 30.0
 
 face_detector_node:
   ros__parameters:
     input_topic: "/oak/rgb/image_raw"
-    # Her kareyi tanımaya gerek yok; 3 = her 3. kare (30 FPS'te ~10 Hz)
-    process_every_n: 3
-    # SFace kosinüs eşiği: yükseltmek yanlış tanımayı azaltır, tanımayı zorlaştırır
-    match_threshold: 0.363
-    # İsim yayınlanmadan önce üst üste kaç karede aynı çıkmalı (titremeyi önler)
-    stable_frames: 3
-    # Aşağıdakiler yalnızca yüz modelleri yoksa (Haar yedeği) kullanılır
+    # 1 = her kare. Yüklü bir kare ~13.5 ms sürüyor, 30 FPS'in bütçesi 33 ms —
+    # atlamaya gerek yok. Bunu büyütmek doğrudan takip gecikmesine dönüşür.
+    process_every_n: 1
+    # Cascade ayarı — yalnızca yunet.onnx kurulu DEĞİLKEN (Haar yedeği) etkili.
+    # YuNet kendi ölçek aramasını yapar.
     scale_factor: 1.1
     min_neighbors: 5
-    min_size: 30
+    min_size: 36

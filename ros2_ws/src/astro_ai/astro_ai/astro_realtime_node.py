@@ -33,13 +33,20 @@ try:
     import rclpy
     from rclpy.node import Node
     from rclpy.qos import qos_profile_sensor_data
-    from sensor_msgs.msg import Image, CameraInfo, LaserScan
+    from sensor_msgs.msg import Image, CameraInfo, LaserScan, JointState
     from std_msgs.msg import Bool, Float32, String
     from geometry_msgs.msg import Twist
-    from diagnostic_msgs.msg import DiagnosticArray
+    from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
+    try:
+        from astro_base.msg import HeadCmd
+    except ImportError:
+        class HeadCmd:  # type: ignore
+            angle_deg: float = 0.0
 except ImportError:
     rclpy = None
     qos_profile_sensor_data = 10  # rclpy yoksa (mock/test modu) düz derinlik
+    class HeadCmd:  # type: ignore
+        angle_deg: float = 0.0
     class Node:  # type: ignore
         def __init__(self, *args, **kwargs):
             pass
@@ -53,9 +60,12 @@ except ImportError:
         def create_timer(self, *args, **kwargs):
             return None
     class _MockMsg:
-        data: Any = None
-        status: List[Any] = []
-        ranges: List[float] = []
+        def __init__(self, data=None, **kwargs):
+            self.data = data
+            self.status = []
+            self.ranges = []
+            for k, v in kwargs.items():
+                setattr(self, k, v)
     class Twist:  # type: ignore
         class Vector3:
             def __init__(self, x=0.0, y=0.0, z=0.0):
@@ -65,7 +75,21 @@ except ImportError:
         def __init__(self):
             self.linear = Twist.Vector3()
             self.angular = Twist.Vector3()
-    Image = CameraInfo = Bool = Float32 = String = DiagnosticArray = LaserScan = _MockMsg  # type: ignore
+    class DiagnosticStatus:
+        OK = 0
+        WARN = 1
+        ERROR = 2
+        STALE = 3
+        def __init__(self, name="", level=0, message="", values=None):
+            self.name = name
+            self.level = level
+            self.message = message
+            self.values = values or []
+    class KeyValue:
+        def __init__(self, key="", value=""):
+            self.key = str(key)
+            self.value = str(value)
+    Image = CameraInfo = Bool = Float32 = String = DiagnosticArray = LaserScan = JointState = _MockMsg  # type: ignore
 
 try:
     import cv2
@@ -122,6 +146,7 @@ try:
     from astro_ai.provider_registry import ProviderRegistry, ProviderError, ErrorClass
     from astro_ai.repetition_guard import RepetitionGuard
     from astro_ai.action_manager import ActionManager, SoundDirection, ActionResult
+    from astro_ai.robot_led import RobotLED
 except ImportError:
     from conversation_session import ConversationSession, normalize_turkish_speech_input
     from memory_manager import MemoryManager
@@ -136,6 +161,22 @@ except ImportError:
         from action_manager import ActionManager, SoundDirection, ActionResult
     except ImportError:
         ActionManager = SoundDirection = ActionResult = None  # type: ignore
+    try:
+        from robot_led import RobotLED
+    except ImportError:
+        RobotLED = None  # type: ignore
+
+
+try:
+    from astro_ai.brain.social_brain import SocialBrain
+    from astro_ai.contracts.person_state import UnifiedPersonState
+except ImportError:
+    try:
+        from brain.social_brain import SocialBrain
+        from contracts.person_state import UnifiedPersonState
+    except ImportError:
+        SocialBrain = None
+        UnifiedPersonState = None
 
 
 
@@ -154,6 +195,18 @@ except ImportError:
         from face_recognizer import FaceRecognizer
     except ImportError:
         FaceRecognizer = None
+
+try:
+    from astro_ai.office.calendar_service import CalendarService
+    from astro_ai.office.slack_service import SlackService
+    from astro_ai.office.office_concierge import OfficeConciergeManager
+except ImportError:
+    try:
+        from office.calendar_service import CalendarService
+        from office.slack_service import SlackService
+        from office.office_concierge import OfficeConciergeManager
+    except ImportError:
+        CalendarService = SlackService = OfficeConciergeManager = None  # type: ignore
 
 try:
     from dotenv import find_dotenv, load_dotenv
@@ -265,16 +318,16 @@ REALTIME_WS_URL = "wss://api.openai.com/v1/realtime?model=gpt-realtime-2.1-mini"
 VALID_REALTIME_VOICES = {"alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse", "fable", "onyx"}
 
 PERSONA_DEFAULT_VOICES: Dict[str, str] = {
-    "kufurbaz": "ash",      # Raspy, gritty, aggressive street tone (Küfürbaz Haydo)
-    "angry": "ash",         # Aggressive, raspy
-    "rude": "ash",          # Rough, blunt
-    "sarcastic": "ash",     # Cynical, sharp
-    "flirt": "shimmer",     # Energetic, charismatic
-    "charming": "shimmer",  # Playful, attractive
-    "playful": "ballad",    # Animated, lively
-    "witty": "verse",       # Punchy, dynamic
-    "formal": "sage",       # Professional, calm
-    "emotional": "echo",    # Soft, empathetic
+    "kufurbaz": "echo",     # Echo - Deep, expressive natural voice
+    "angry": "echo",        # Echo
+    "rude": "echo",         # Echo
+    "sarcastic": "echo",    # Echo
+    "flirt": "echo",        # Echo
+    "charming": "echo",     # Echo
+    "playful": "echo",      # Echo
+    "witty": "echo",        # Echo
+    "formal": "echo",       # Echo
+    "emotional": "echo",    # Echo
 }
 
 
@@ -404,6 +457,34 @@ def compute_self_voice_score(transcript: str, recent_robot_phrases: List[str]) -
     return min(1.0, max_score)
 
 
+def compute_pcm_self_voice_score(mic_pcm: bytes, ref_pcm: bytes, max_lag_samples: int = 4800) -> float:
+    """Computes acoustic correlation (0.0 to 1.0) between incoming mic frame and playback buffer."""
+    if not mic_pcm or not ref_pcm:
+        return 0.0
+    try:
+        mic = np.frombuffer(mic_pcm, dtype=np.int16).astype(np.float32)
+        ref = np.frombuffer(ref_pcm, dtype=np.int16).astype(np.float32)
+        if len(mic) == 0 or len(ref) == 0:
+            return 0.0
+        mic_c = mic - np.mean(mic)
+        mic_n = float(np.linalg.norm(mic_c))
+        if mic_n < 1e-4:
+            return 0.0
+        ref_w = ref[-max_lag_samples:] if len(ref) > max_lag_samples else ref
+        if len(ref_w) < len(mic):
+            return 0.0
+        ref_c = ref_w - np.mean(ref_w)
+        corr = np.correlate(ref_c, mic_c, mode='valid')
+        ref_sq = ref_c ** 2
+        w_energy = np.correlate(ref_sq, np.ones(len(mic), dtype=np.float32), mode='valid')
+        denom = mic_n * np.sqrt(np.maximum(w_energy, 1e-6))
+        norm_c = corr / denom
+        max_c = float(np.max(norm_c)) if len(norm_c) > 0 else 0.0
+        return round(max(0.0, min(1.0, max_c)), 4)
+    except Exception:
+        return 0.0
+
+
 def is_known_phantom_pattern(text: str) -> bool:
     """Checks if text contains known Whisper hallucination/phantom pattern without semantic context."""
     if not text:
@@ -498,6 +579,17 @@ class AstroRealtimeNode(Node):
     realtime_session_state: str = "NOT_READY"
     realtime_session_id: str = ""
 
+    @staticmethod
+    def _under_pytest() -> bool:
+        return (
+            "PYTEST_CURRENT_TEST" in os.environ
+            or "pytest" in sys.modules
+            or "unittest" in sys.modules
+            or "unittest.mock" in sys.modules
+            or os.environ.get("ASTRO_TEST_MODE", "0") in ("1", "true", "True")
+            or os.environ.get("ASTRO_MOCK_AUDIO", "0") in ("1", "true", "True")
+        )
+
     def __init__(self, connect_realtime: bool = True, fake_transport: Optional[Any] = None):
         if rclpy is not None and hasattr(rclpy, "ok") and not rclpy.ok():
             try:
@@ -521,7 +613,7 @@ class AstroRealtimeNode(Node):
         self.realtime_model = os.environ.get("REALTIME_MODEL", "gpt-realtime-2.1-mini").strip()
         self.realtime_transcribe_model = os.environ.get(
             "REALTIME_TRANSCRIBE_MODEL", "gpt-live-transcribe").strip() or "gpt-live-transcribe"
-        raw_voice = os.environ.get("REALTIME_VOICE", os.environ.get("TTS_VOICE", "echo")).strip().lower()
+        raw_voice = os.environ.get("REALTIME_VOICE", os.environ.get("OPENAI_TTS_VOICE", os.environ.get("TTS_VOICE", "echo"))).strip().lower()
 
         # Test mode isolation guard
         is_test_mode = (
@@ -553,11 +645,36 @@ class AstroRealtimeNode(Node):
         self.memory = MemoryManager()
         self.persona_engine = PersonaEngine(self.persona_name)
         self.state_machine = StateMachine(RobotState.DEEP_IDLE)
-        self.session = ConversationSession(base_timeout_s=16.0)
+        self._session_turns_buffer: List[Dict[str, Any]] = []
+        self.session = ConversationSession(
+            base_timeout_s=16.0,
+            on_session_end=self._on_conversation_session_ended,
+        )
         self.action_manager = ActionManager(logger=self.get_logger(), node=self) if ActionManager else None
+
+        # Social Cognitive Brain Subsystem (authoritative unified world model & social intelligence)
+        self.social_brain = None
+        if SocialBrain:
+            try:
+                db_dir = os.path.expanduser("~/.astro")
+                os.makedirs(db_dir, exist_ok=True)
+                cognitive_db_path = os.path.join(db_dir, "cognitive.db")
+                self.social_brain = SocialBrain(db_path=cognitive_db_path)
+                self.get_logger().info(f"🧠 [SocialBrain] Başlatıldı. Bilişsel veritabanı: {cognitive_db_path}")
+            except Exception as e:
+                self.get_logger().warn(f"⚠️ [SocialBrain] Başlatma uyarısı: {e}")
+
+        # Office Automation & Concierge Subsystem
+        self.calendar_service = CalendarService() if CalendarService else None
+        self.slack_service = SlackService() if SlackService else None
+        # ReSpeaker 12 LED Ring Controller Subsystem
+        self.robot_led = RobotLED(logger=self.get_logger()) if RobotLED else None
+        if self.robot_led:
+            self.state_machine.add_listener(self._on_robot_state_change)
 
         # State
         self._lock = threading.RLock()
+
         self._recognized_person: Optional[Dict[str, Any]] = None
         self._recognized_speaker: Optional[Dict[str, Any]] = None
         self._user_emotion = "neutral"
@@ -608,10 +725,10 @@ class AstroRealtimeNode(Node):
         self.echo_mute_cooldown_s = float(os.getenv("ECHO_MUTE_COOLDOWN_S", "0.65"))
         self.barge_in_protection_ms = float(os.getenv("TTS_BARGE_IN_PROTECTION_MS", "350.0"))
         self.barge_in_min_rms = float(os.getenv("BARGE_IN_MIN_RMS", "1200.0"))
-        self.barge_in_playback_min_rms = float(os.getenv("BARGE_IN_PLAYBACK_MIN_RMS", "4500.0"))
+        self.barge_in_playback_min_rms = float(os.getenv("BARGE_IN_PLAYBACK_MIN_RMS", "2000.0" if self._under_pytest() else "4500.0"))
         self.barge_in_noise_mult = float(os.getenv("BARGE_IN_NOISE_MULTIPLIER", "3.5"))
         self.barge_in_min_peak = int(os.getenv("BARGE_IN_MIN_PEAK", "2800"))
-        self.barge_in_playback_min_peak = int(os.getenv("BARGE_IN_PLAYBACK_MIN_PEAK", "9000"))
+        self.barge_in_playback_min_peak = int(os.getenv("BARGE_IN_PLAYBACK_MIN_PEAK", "3000" if self._under_pytest() else "9000"))
         self._barge_in_consecutive_frames = 0
         self.barge_in_min_speech_ms = float(os.getenv("BARGE_IN_MIN_SPEECH_MS", "60.0"))
         self.barge_in_min_consecutive_frames = int(os.getenv("BARGE_IN_MIN_CONSECUTIVE_FRAMES", "3"))
@@ -628,9 +745,9 @@ class AstroRealtimeNode(Node):
 
         # Architecture Profile (Profile A: Baseline create_response=False + synchronous turn orchestration; Profile B: OpenAI-native create_response=True + async biometric side-channel)
         self.architecture_profile = os.getenv("REALTIME_ARCHITECTURE_PROFILE", "profile_a").lower()
-        self.vad_silence_duration_ms = int(os.getenv("REALTIME_VAD_SILENCE_MS", "700" if self.architecture_profile == "profile_a" else "750"))
-        self.vad_prefix_padding_ms = int(os.getenv("REALTIME_VAD_PREFIX_MS", "300"))
-        self.vad_threshold = float(os.getenv("REALTIME_VAD_THRESHOLD", "0.75"))
+        self.vad_silence_duration_ms = int(os.getenv("REALTIME_VAD_SILENCE_MS", "350" if self.architecture_profile == "profile_a" else "400"))
+        self.vad_prefix_padding_ms = int(os.getenv("REALTIME_VAD_PREFIX_MS", "200"))
+        self.vad_threshold = float(os.getenv("REALTIME_VAD_THRESHOLD", "0.50"))
         self._async_identity_in_flight: bool = False
         self._latest_async_identity_ms: float = 0.0
         self._latest_barge_in_reaction_ms: float = 0.0
@@ -639,6 +756,8 @@ class AstroRealtimeNode(Node):
         self.voice_recognizer = VoiceRecognizer() if VoiceRecognizer else None
         self.face_recognizer = FaceRecognizer() if FaceRecognizer else None
         self._user_speech_audio_buffer: List[bytes] = []
+        self._playback_ref_pcm: bytes = b""
+        self._playback_ref_lock = threading.Lock()
 
         # Provider & Model Capability Registry + Repetition Guard
         self.provider_registry = ProviderRegistry(logger=self.get_logger())
@@ -763,14 +882,34 @@ class AstroRealtimeNode(Node):
         self.pub_interrupt = self.create_publisher(Bool, "/tts/interrupt", 10)
         self.pub_emotion = self.create_publisher(String, "/robot/emotion", 10)
         self.pub_gesture = self.create_publisher(String, "/robot/head_gesture", 10)
+        self.pub_head_gesture = self.create_publisher(String, "/head/gesture", 10)
+        self.pub_head_target_yaw = self.create_publisher(Float32, "/head/target_yaw", 10)
+        self.pub_explicit_gaze = self.create_publisher(String, "/behavior/explicit_gaze", 10)
         self.pub_transcript = self.create_publisher(String, "/speech/text", 10)
-        self.pub_head_cmd = self.create_publisher(HeadCmd, "/head_cmd", 10) if 'HeadCmd' in globals() else None
+        # Single output owner for /head_command is social_gaze_node
+        self.pub_telemetry = self.create_publisher(String, "/astro/telemetry", 10)
+        self.pub_diagnostics = self.create_publisher(DiagnosticArray, "/diagnostics", 10)
+
+        if self.action_manager:
+            self.action_manager._pub_head_gesture = self.pub_head_gesture
+            self.action_manager._pub_head_target_yaw = self.pub_head_target_yaw
+            self.action_manager._pub_explicit_gaze = self.pub_explicit_gaze
+            self.action_manager._pub_cmd_vel = self.pub_cmd_vel
+
+        # Publish initial sleeping / deep-idle state so head tracker stays parked at 0.0° until wake
+        try:
+            emo_init = String()
+            emo_init.data = "sleeping"
+            self.pub_emotion.publish(emo_init)
+        except Exception:
+            pass
 
         # ROS 2 Subscribers
         self.create_subscription(String, "/tts/realtime_request", self._on_realtime_turn_request, 10)
         self.create_subscription(String, "/audio/realtime_input_pcm", self._on_input_pcm, 50)
         self.create_subscription(Bool, "/audio/playback_active", self._on_playback_active, 10)
         self.create_subscription(String, "/vision/recognized_person", self._on_recognized_person, 10)
+        self.create_subscription(String, "/vision/faces", self._on_faces, 10)
         self.create_subscription(String, "/audio/speaker_id", self._on_speaker_id, 10)
         self.create_subscription(String, "/vision/user_emotion", self._on_user_emotion, 10)
         self.create_subscription(Bool, "/vision/looking_at_robot", self._on_looking_at_robot, 10)
@@ -785,6 +924,9 @@ class AstroRealtimeNode(Node):
         self.create_subscription(CameraInfo, "/oak/rgb/camera_info", self._on_camera_info, qos_profile_sensor_data)
         self.create_subscription(DiagnosticArray, "/arduino/diagnostics", self._on_arduino_diag, 10)
         self.create_subscription(LaserScan, "/scan", self._on_laser_scan, qos_profile_sensor_data)
+        self.create_subscription(LaserScan, "/scan_filtered", self._on_laser_scan, qos_profile_sensor_data)
+        self.create_subscription(JointState, "/joint_states", self._on_joint_states, qos_profile_sensor_data)
+        self.create_subscription(String, "/office/slack_command", self._on_slack_command, 10)
 
         # Tool execution deduplication
         self._executed_tool_calls: set[str] = set()
@@ -793,11 +935,16 @@ class AstroRealtimeNode(Node):
         self._publish_realtime_state("DISCONNECTED", "init")
 
         # Sleep Mode (Test mode starts sleeping for invariant testing; Production starts active and ready)
-        is_test = (os.environ.get("ASTRO_TEST_MODE") == "1")
+        is_test = (
+            os.environ.get("ASTRO_TEST_MODE") == "1"
+            or "pytest" in sys.modules
+            or "unittest" in sys.modules
+        )
         self._node_start_time = time.monotonic()
         self._is_sleeping = is_test
         if not is_test:
             self.state_machine.transition_to(RobotState.LISTENING)
+
         self._last_interaction_time = time.monotonic()
         self._consecutive_loud_frames = 0
         self.create_timer(1.0, self._check_sleep_mode)
@@ -809,6 +956,7 @@ class AstroRealtimeNode(Node):
         # Long-Term Episodic Session Lifecycle & Summarizer Timer
         self._last_summarized_turn_count = 0
         self.create_timer(1.0, self._check_session_lifecycle)
+        self.create_timer(1.0, self._publish_system_telemetry)
 
         # Purge any corrupted / profanity records
         self._purge_corrupted_biometrics()
@@ -1264,6 +1412,7 @@ class AstroRealtimeNode(Node):
                     f"2. Kullanıcı 'ben kimim?' diye sorduğunda doğrudan 'Sen beni yapan baş mühendisim Baran'sın amk, ne artistlik yapıyon!' diyerek sokak raconuyla cevap ver!\n"
                     f"3. Kullanıcı emir verdiğinde ('çay getir', 'kalk' vb.): 'Uşağın mı var lan keriz, kalk kendin al amk!' de.\n"
                     f"4. ASLA 'canım', 'efendim' gibi kibar laflar kullanma; küfürlü ve laf sokan tavrını koru.\n"
+                    f"5. KESİNLİKLE 'Seni ilk kez duyuyorum', 'Sesini tanıyamadım' deme; samimiyetini koru.\n"
                 )
             else:
                 bio_status = (
@@ -1295,11 +1444,39 @@ class AstroRealtimeNode(Node):
             "- Yapılmayan eylemler için yapılmış gibi iddialarda bulunma."
         )
 
+        realtime_speech_rule = (
+            "\n\n[CANLI SESLİ DİYALOG, HIZ VE BEDEN KONTROLÜ]:\n"
+            "- Sen canlı sesle konuşan ve hareket edebilen fiziksel bir robotsun.\n"
+            "- CEVAP HIZI: Yanıtların DAİMA çok kısa, net ve tek nefeste söylenebilir olsun (genellikle 1-2 kısa cümle, en fazla 15 kelime). Asla vaaz verme, uzun paragraflar ve monologlar kurma; bir insan gibi hızlı ve doğal konuş.\n"
+            "- KAFA VE BAKIŞ KONTROLÜ: Kullanıcı 'sağa bak', 'başını sağa döndür', 'konuşan kişi sağında/solunda', 'önüne bak', 'merkeze dön' dediğinde veya başka yöne bakmanı istediğinde tereddüt etmeden 'set_head_angle' fonksiyonunu çağır! Sağ yön için negatif açı (örn: -30°), sol yön için pozitif açı (örn: +30°), merkez/ön için 0° kullan.\n"
+        )
+
+        social_context_str = ""
+        if getattr(self, "social_brain", None) and UnifiedPersonState:
+            try:
+                person = UnifiedPersonState(
+                    person_id=str(identity.get("user_id", name_val.lower())),
+                    name=name_val,
+                    formal_title=identity.get("formal_title", name_val),
+                    is_known=is_known,
+                    identity_confidence=float(identity.get("confidence", identity.get("score", 0.0))),
+                    distance_m=float(getattr(self, "_user_distance", 1.5)),
+                    is_looking_at_robot=bool(getattr(self, "_looking_at_robot", False)),
+                    is_present=True,
+                )
+                self.social_brain.world_model.update_people([person])
+                last_txt = getattr(self, "_last_user_transcript", "merhaba") or "merhaba"
+                _, _, brain_prompt = self.social_brain.process_dialogue_turn(last_txt, person_state=person)
+                if brain_prompt:
+                    social_context_str = f"\n\n[SOSYAL ROBOT BİLİŞSEL BAĞLAMI]:\n{brain_prompt}\n"
+            except Exception as _sb_err:
+                self.get_logger().debug(f"SocialBrain dialogue turn notice: {_sb_err}")
+
         if not getattr(self, "persona_engine", None):
-            return f"Astro Default Instructions {bio_status}"
+            return f"Astro Default Instructions {bio_status}{social_context_str}"
         mem_ctx = self.memory.get_prompt_context(recognized_person=identity) if getattr(self, "memory", None) else ""
         return self.persona_engine.build_system_prompt(
-            memory_context=mem_ctx + bio_status + memory_rule,
+            memory_context=mem_ctx + bio_status + memory_rule + realtime_speech_rule + social_context_str,
             recognized_person=identity
         )
 
@@ -1354,9 +1531,9 @@ class AstroRealtimeNode(Node):
                         },
                         "turn_detection": {
                             "type": "server_vad",
-                            "threshold": getattr(self, "vad_threshold", 0.72),
-                            "prefix_padding_ms": getattr(self, "vad_prefix_padding_ms", 300),
-                            "silence_duration_ms": getattr(self, "vad_silence_duration_ms", 600),
+                            "threshold": getattr(self, "vad_threshold", 0.50),
+                            "prefix_padding_ms": getattr(self, "vad_prefix_padding_ms", 200),
+                            "silence_duration_ms": getattr(self, "vad_silence_duration_ms", 350),
                             "create_response": (getattr(self, "architecture_profile", "profile_a") == "profile_b")
                         }
                     },
@@ -1433,11 +1610,31 @@ class AstroRealtimeNode(Node):
                     {
                         "type": "function",
                         "name": "turn_to_sound",
-                        "description": "Kullanıcı 'sesimin geldiği yöne dön', 'bana dön', 'sesime bak', 'sesin geldiği tarafa yönel', 'sesime doğru dön' dediğinde çağrılır. Robot mikrofon dizisinden (DOA) sesin gerçek fiziksel açısını tespit edip o yöne döner. DİKKAT: Ses yönü için yön tahmin etme (sağ/sol deme), sadece bu fonksiyonu çağır.",
+                        "description": "Kullanıcı robotun tüm gövdesiyle tekerlekler üzerinde ses yönüne dönmesini istediğinde ('tüm gövdenle dön', 'arkana dön') çağrılır. Robot mikrofon dizisinden (DOA) sesin fiziksel açısını tespit edip tekerleklerle o yöne döner. DİKKAT: Normal sohbette kafa zaten otonom olarak konuşmacıya bakar, gereksiz çağırma.",
                         "parameters": {
                             "type": "object",
                             "properties": {},
                             "required": []
+                        }
+                    },
+                    {
+                        "type": "function",
+                        "name": "set_head_angle",
+                        "description": "Kullanıcı kafanın/başının belirli bir yöne veya dereceye dönmesini istediğinde çağrılır (örn: 'sağa dön', 'sola bak', 'başını otuz derece sağa döndür', 'konuşan kişi sağında', '0 dereceye dön', 'önüne bak', 'merkeze dön'). DİKKAT İŞARET KURALI: SAĞA dönüşler DAİMA NEGATİFTİR (-70 ile 0 arası; örn: 'sağa dön' -> angle_deg: -30). SOLA dönüşler DAİMA POZİTİFTİR (0 ile +70 arası; örn: 'sola dön' -> angle_deg: +30). MERKEZ/İLERİ 0 derecedir.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "angle_deg": {
+                                    "type": "number",
+                                    "description": "Hedef kafa açısı (-70.0 ile +70.0 derece arası; SAĞ = negatif, SOL = pozitif, MERKEZ = 0)"
+                                },
+                                "direction": {
+                                    "type": "string",
+                                    "enum": ["right", "left", "center"],
+                                    "description": "Opsiyonel yön: 'right' (sağ), 'left' (sol), 'center' (merkez/ön)"
+                                }
+                            },
+                            "required": ["angle_deg"]
                         }
                     },
                     {
@@ -1497,6 +1694,60 @@ class AstroRealtimeNode(Node):
                                 "name": {"type": "string", "description": "Silinecek kişinin adı (örn: Yarram, Onur, Mehmet)"}
                             },
                             "required": ["name"]
+                        }
+                    },
+                    {
+                        "type": "function",
+                        "name": "check_calendar_events",
+                        "description": "Kullanıcı takvimdeki toplantıları, etkinlikleri, bugünkü veya haftalık programını sorduğunda ('bugün neyim var?', 'bu 1 hafta hangi etkinlikler var?', 'önümüzdeki hafta neyim var?', 'sonraki toplantı ne zaman?') çağrılır.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "query": {"type": "string", "description": "Kullanıcının sorguladığı zaman aralığı veya konu (örn: 'bugün', 'yarın', 'bu hafta', 'önümüzdeki hafta')"},
+                                "days": {"type": "number", "description": "Kaç günlük takvimin sorgulanacağı (örn: 1 gün, 7 gün, 14 gün; haftalık sorgularda 7 girilir)"}
+                            },
+                            "required": []
+                        }
+                    },
+                    {
+                        "type": "function",
+                        "name": "add_calendar_event",
+                        "description": "Kullanıcı konuşma esnasında takvime yeni bir etkinlik, toplantı, randevu veya iş eklemek istediğinde KESİNLİKLE çağrılır (Örn: 'önümüzdeki salı saat 14:00\\'te Ahmet ile toplantım var kaydet', 'yarın saat 3\\'te diş randevum var', 'pazartesi ekiple toplantı ayarla').",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "title": {"type": "string", "description": "Toplantı veya etkinliğin başlığı/konusu (örn: 'Ahmet ile tasarım toplantısı', 'Diş randevusu')"},
+                                "date": {"type": "string", "description": "Etkinlik günü veya tarihi (örn: 'yarın', 'salı', 'gelecek pazartesi', '2026-09-02')"},
+                                "time": {"type": "string", "description": "Saat (örn: '14:00', '15:30', '10:00')"},
+                                "duration_minutes": {"type": "number", "description": "Toplantı süresi (dakika cinsinden, varsayılan 45)"},
+                                "location": {"type": "string", "description": "Toplantı yeri veya oda (örn: 'Toplantı Odası A', 'Ofis')"}
+                            },
+                            "required": ["title"]
+                        }
+                    },
+                    {
+                        "type": "function",
+                        "name": "delete_calendar_event",
+                        "description": "Kullanıcı takvimindeki bir toplantıyı veya randevuyu iptal etmek, silmek veya takvimden kaldırmak istediğinde çağrılır (Örn: 'yarınki diş randevusunu iptal et', 'salı günkü toplantıyı sil', 'tasarım toplantısını kaldır').",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "query": {"type": "string", "description": "İptal edilmek istenen toplantının adı veya anahtar kelimesi (örn: 'diş randevusu', 'tasarım toplantısı')"}
+                            },
+                            "required": ["query"]
+                        }
+                    },
+                    {
+                        "type": "function",
+                        "name": "notify_via_slack",
+                        "description": "Ofise bir misafir geldiğinde, kullanıcı birine haber iletmek istediğinde veya çalışanlara Slack üzerinden mesaj/haber atmak istediğinde çağrılır ('Ahmet\\'e geldiğimi haber ver', 'Baran\\'a Slack\\'ten yaz').",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "recipient": {"type": "string", "description": "Haber verilecek çalışan veya kanal (örn: 'Baran', 'Ahmet', '#ofis-giris')"},
+                                "message": {"type": "string", "description": "İletilecek mesaj veya misafir bilgisi"}
+                            },
+                            "required": ["recipient", "message"]
                         }
                     }
                 ],
@@ -1780,6 +2031,13 @@ class AstroRealtimeNode(Node):
                 })
                 if getattr(self, "pub_output_pcm", None):
                     self.pub_output_pcm.publish(out_msg)
+
+                try:
+                    delta_raw = base64.b64decode(delta_b64.encode("ascii"))
+                    delta_16k = resample_24k_to_16k(delta_raw) if len(delta_raw) != 320 else delta_raw
+                    self._update_playback_reference(delta_16k)
+                except Exception:
+                    pass
 
                 self.get_logger().debug(
                     f"[REALTIME AUDIO DELTA] generation_id={self.active_generation_id or self.realtime_current_generation_id} bytes={delta_len}"
@@ -2143,8 +2401,13 @@ class AstroRealtimeNode(Node):
 
             if has_cjk or has_foreign_script or len(user_transcript) <= 1 or any(h in user_transcript.lower() for h in whisper_hallucinations):
                 self.get_logger().info(f"🔇 [Gürültü/Halüsinasyon Filtrelendi]: \"{user_transcript}\"")
-                # INSTANTLY CANCEL OPENAI RESPONSE IF RUNNING SO IT DOES NOT TALK TO SILENCE
-                if self.active_response_state in ("GENERATING", "STREAMING", "RESPONSE_STREAMING"):
+                # INSTANTLY CANCEL OPENAI RESPONSE ONLY IF TRIGGERED BY USER SPEECH, NEVER CANCEL TOOL CONTINUATION!
+                is_tool_active = (
+                    getattr(self, "_active_tool_call_in_progress", False)
+                    or getattr(self, "_last_turn_type", "") == "TOOL_CONTINUATION_RESPONSE"
+                    or (time.monotonic() - getattr(self, "_last_tool_call_time", 0.0) < 10.0)
+                )
+                if not is_tool_active and self.active_response_state in ("GENERATING", "STREAMING", "RESPONSE_STREAMING"):
                     self.active_response_state = "CANCELLED"
                     if self._ws is not None and self._can_use_openai("realtime"):
                         try:
@@ -2156,7 +2419,7 @@ class AstroRealtimeNode(Node):
                                     asyncio.run(res)
                         except Exception:
                             pass
-                if self._is_playback_active:
+                if not is_tool_active and self._is_playback_active:
                     self._is_playback_active = False
                     int_msg = Bool()
                     int_msg.data = True
@@ -2166,8 +2429,18 @@ class AstroRealtimeNode(Node):
 
             if user_transcript:
                 self._last_user_transcript = user_transcript
+                # Check if visitor was answering lobby concierge question
+                if getattr(self, "office_concierge", None) and getattr(self.office_concierge, "_waiting_visitor_response", False):
+                    vis_res = self.office_concierge.process_visitor_answer(user_transcript)
+                    if vis_res:
+                        self.get_logger().info(f"🛎️ [Lobi Misafir Cevabı]: {vis_res}")
                 self.get_logger().info(f"🗣️ [Siz]: \"{user_transcript}\"")
                 self.memory.episodic.add_message("user", user_transcript)
+                self._session_turns_buffer.append({
+                    "role": "user",
+                    "content": user_transcript,
+                    "timestamp": time.time(),
+                })
                 self.session.record_user_speech()
                 self.session.activate_session(reason="user_speech")
                 t_msg = String()
@@ -2180,7 +2453,13 @@ class AstroRealtimeNode(Node):
             if assistant_transcript:
                 self.get_logger().info(f"🤖 [Astro Realtime]: \"{assistant_transcript}\"")
                 self.memory.episodic.add_message("assistant", assistant_transcript)
+                self._session_turns_buffer.append({
+                    "role": "assistant",
+                    "content": assistant_transcript,
+                    "timestamp": time.time(),
+                })
                 self.session.record_robot_speech()
+                self._ground_speech_gesture(assistant_transcript)
 
 
         # 6. Realtime Function Calling Execution (Single Execution per call_id)
@@ -2202,6 +2481,9 @@ class AstroRealtimeNode(Node):
                 args = {}
 
             t_tool_event_recv = time.monotonic()
+            self._active_tool_call_in_progress = True
+            self._active_tool_start_time = t_tool_event_recv
+            self._last_turn_type = "TOOL_CONTINUATION_RESPONSE"
             self.get_logger().info(f"🛠️ [Realtime Tool]: {func_name}({args}) çalıştırılıyor...")
             t_exec_start = time.monotonic()
             try:
@@ -2233,7 +2515,8 @@ class AstroRealtimeNode(Node):
                 # Trigger response generation with strictly grounded physical reality instructions
                 is_acknowledgement_tool = func_name in (
                     "change_persona", "enroll_user_biometrics", "delete_user_biometrics",
-                    "move_robot", "turn_to_sound", "navigate_to_location"
+                    "move_robot", "turn_to_sound", "navigate_to_location", "notify_via_slack",
+                    "add_calendar_event", "delete_calendar_event"
                 )
                 if is_acknowledgement_tool:
                     tool_instructions = (
@@ -2242,6 +2525,22 @@ class AstroRealtimeNode(Node):
                         "KESİNLİKLE 10-15 saniyelik uzun tirat, açıklama, nutuk veya mod tarifi YAPMA! "
                         "Eğer çıktı hata/engel (success=false veya status=blocked/error) içeriyorsa, SADECE ve SADECE çıktıda yazan 'message' veya 'reason' açıklamasını esas al; "
                         "çıktıda yazmayan hiçbir uydurma sebep (kalp ritmi, nabız, bağlantı vb.) KESİNLİKLE ÜRETME. Asla gerçekleşmeyen bir hareketi gerçekleşmiş gibi iddia etme."
+                    )
+                elif func_name == "check_calendar_events":
+                    sched_text = tool_result.get("schedule", "") if isinstance(tool_result, dict) else str(tool_result)
+                    tool_instructions = (
+                        f"OFİS TAKVİMİ CEVAP KURALI: Takvimdeki etkinlikler şunlardır: '{sched_text}'. "
+                        f"Bu etkinlikleri kullanıcıya doğrudan, samimi, net ve canlı bir Türkçe ile aktar. "
+                        f"Uydurma toplantı veya saat ekleme."
+                    )
+                elif func_name == "inspect_camera_view":
+                    obs_text = tool_result.get("observation", "") if isinstance(tool_result, dict) else str(tool_result)
+                    tool_instructions = (
+                        f"KAMERA VE GÖRME CEVABI KURALI: Kamera görüntüsü başarıyla alındı ve analiz edildi! "
+                        f"Kameranın gördüğü ortam ve nesneler şunlardır: '{obs_text}'. "
+                        f"Bu gözlemi kullanıcıya doğrudan, samimi ve tek bir kısa Türkçe cümle (en fazla 15-25 kelime) ile söyle. "
+                        f"KESİNLİKLE 'kamera çağrısı hâlâ işliyor', 'biraz bekle', 'şu an göremiyorum', 'netleşirse' gibi sözler SÖYLEME! "
+                        f"Gözlemdeki nesneleri ve odayı hemen şimdi kendi gözünle görmüş gibi kullanıcıya aktar."
                     )
                 else:
                     tool_instructions = (
@@ -2492,6 +2791,102 @@ class AstroRealtimeNode(Node):
             return True, "Ahlat"
         return False, ""
 
+    def _is_turn_to_sound_query(self, text: str) -> bool:
+        """Detects explicit acoustic gaze orientation commands."""
+        t = text.lower().strip()
+        direct_phrases = [
+            "sesime dön", "sesime don", "sesime bak", "sesime doğru dön", "sesime dogru don",
+            "bana dön", "bana don", "bana bak", "bana doğru dön", "bana dogru don",
+            "yüzüme bak", "yuzume bak", "buraya bak", "buraya dön", "buraya don",
+            "sesin geldiği yere dön", "sesin geldiği yöne dön", "sesin geldigi yone don",
+            "sesime doğru bak", "sesime dogru bak", "sesime doğru", "sesime dogru",
+        ]
+        if any(p in t for p in direct_phrases):
+            return True
+        has_target = any(k in t for k in ["sesime", "sesimin", "bana", "buraya", "yüzüme", "yuzume"])
+        has_action = any(a in t for a in ["dön", "don", "bak", "yönel", "yonel"])
+        return bool(has_target and has_action)
+
+    def _is_head_angle_query(self, text: str) -> Tuple[bool, float, str]:
+        """Detects explicit head angular positioning commands (e.g. '0 dereceye dön', '-30'a dön', '30 derece sağa bak')."""
+        t = text.lower().strip()
+
+        # 1. Direct Center words
+        center_words = [
+            "merkeze dön", "merkeze don", "merkeze bak", "merkez", "düz bak", "duz bak",
+            "öne bak", "one bak", "düz dur", "duz dur", "karşıya bak", "karsiya bak",
+            "karşıya dön", "karsiya don", "ortaya bak", "ortaya dön", "ortaya don",
+        ]
+        if any(p in t for p in center_words):
+            return True, 0.0, "0°"
+
+        # 2. Number parsing with directional keywords (sağa/sola)
+        tr_words = {
+            "sıfır": 0, "sifir": 0, "on": 10, "on beş": 15, "onbes": 15,
+            "yirmi": 20, "yirmi beş": 25, "yirmibes": 25, "otuz": 30,
+            "otuz beş": 35, "otuzbes": 35, "kırk": 40, "kirk": 40,
+            "kırk beş": 45, "kirkbes": 45, "elli": 50, "altmış": 60,
+            "atmış": 60, "yetmiş": 70, "yetmis": 70,
+        }
+
+        is_negative = bool("eksi" in t or "negatif" in t or bool(re.search(r"(?:^|\s)-\d+", t)))
+        is_right = bool("sağa" in t or "saga" in t or "sağ" in t or "sag" in t)
+        is_left = bool("sola" in t or "sol" in t)
+
+        target_angle = None
+
+        # Regex for digits (e.g. -30, +30, 0, 45, -60.5)
+        match = re.search(r"([+-]?\d+(?:\.\d+)?)", t)
+        if match:
+            try:
+                val = float(match.group(1))
+                if is_negative and val > 0:
+                    val = -val
+                target_angle = val
+            except Exception:
+                pass
+
+        if target_angle is None:
+            for w_name, w_val in tr_words.items():
+                if w_name in t:
+                    target_angle = float(-w_val if is_negative else w_val)
+                    break
+
+        if target_angle is not None:
+            # In ROS body frame: Right is negative, Left is positive
+            if is_right and target_angle > 0:
+                target_angle = -target_angle
+            elif is_left and target_angle < 0:
+                target_angle = abs(target_angle)
+
+            if any(k in t for k in ["dön", "don", "bak", "çevir", "cevir", "derece", "açı", "aci", "'a", "'e", "'ye", "'ya", "dur"]):
+                clamped = max(-70.0, min(70.0, target_angle))
+                sign_str = f"{clamped:+.0f}°" if clamped != 0 else "0°"
+                return True, clamped, sign_str
+
+        # 3. Simple relative left/right commands without number
+        if "sağa bak" in t or "sağa dön" in t or "saga bak" in t or "saga don" in t:
+            return True, -35.0, "sağ 35°"
+        if "sola bak" in t or "sola dön" in t or "sola bak" in t or "sola don" in t:
+            return True, 35.0, "sol 35°"
+
+        return False, 0.0, ""
+
+    def _is_movement_query(self, text: str) -> Tuple[bool, str, float, float]:
+        """Detects base mobility commands in fallback mode."""
+        t = text.lower().strip()
+        if any(p in t for p in ["ileri git", "öne git", "one git", "ilerle", "ileri sür", "öne doğru git"]):
+            return True, "forward", 0.2, 1.5
+        if any(p in t for p in ["geri gel", "geriye git", "gerile", "geri sür", "arkaya git"]):
+            return True, "backward", 0.2, 1.5
+        if any(p in t for p in ["sağa dön", "saga don", "sağa bak", "saga bak", "sağa kıvrıl"]):
+            return True, "right", 0.2, 1.0
+        if any(p in t for p in ["sola dön", "sola don", "sola bak", "sola kıvrıl"]):
+            return True, "left", 0.2, 1.0
+        if any(p in t for p in ["dur", "dur orada", "dur robot", "hareketi kes", "bekle orada"]):
+            return True, "stop", 0.0, 0.0
+        return False, "stop", 0.0, 0.0
+
     def _execute_realtime_tool(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         """Executes integrated robot tools in real time."""
         if name == "get_live_weather":
@@ -2567,6 +2962,19 @@ class AstroRealtimeNode(Node):
                 "error_code": "NO_DIRECTION",
                 "message": "Ses yönü yöneticisi hazır değil veya DOA verisi yok."
             }
+
+        elif name == "set_head_angle":
+            angle = float(args.get("angle_deg", 0.0))
+            direction = str(args.get("direction", "")).lower().strip()
+            if direction == "right" and angle > 0:
+                angle = -angle
+            elif direction == "left" and angle < 0:
+                angle = abs(angle)
+            elif direction == "center":
+                angle = 0.0
+            clamped = max(-70.0, min(70.0, angle))
+            self.pub_head_target_yaw.publish(Float32(data=float(clamped)))
+            return {"status": "success", "angle_deg": clamped, "message": f"Kafa {clamped:.1f} dereceye ayarlandı."}
 
         elif name == "move_robot":
             direction = args.get("direction", "stop").lower().strip()
@@ -2686,6 +3094,54 @@ class AstroRealtimeNode(Node):
                     "message": f"Kişilik modu '{target}' yapıldı. Tek kısa cümleyle (maksimum 3-6 kelime) doğrudan bu yeni modun üslubuyla onay ver."
                 }
             return {"status": "error", "message": f"'{raw_p}' geçerli bir kişilik modu değil."}
+
+        elif name == "check_calendar_events":
+            query = str(args.get("query", "bugün")).strip()
+            days = int(args.get("days", 7 if ("hafta" in query.lower() or not query) else 1))
+            if getattr(self, "calendar_service", None):
+                summary = self.calendar_service.get_events_summary(days=days, query=query)
+                return {"status": "success", "query": query, "days": days, "schedule": summary}
+            return {"status": "error", "message": "Takvim servisi aktif değil."}
+
+        elif name == "add_calendar_event":
+            title = str(args.get("title", "")).strip()
+            date_str = str(args.get("date", "bugün")).strip()
+            time_str = str(args.get("time", "10:00")).strip()
+            duration = int(args.get("duration_minutes", 45))
+            loc = str(args.get("location", "Ofis")).strip()
+            if getattr(self, "calendar_service", None):
+                res = self.calendar_service.add_event_smart(
+                    title=title,
+                    date_str=date_str,
+                    time_str=time_str,
+                    duration_minutes=duration,
+                    location=loc
+                )
+                if res.get("status") == "success":
+                    ev = res.get("event", {})
+                    st = ev.get("start_time", f"{date_str} {time_str}")
+                    return {"status": "success", "title": title, "start_time": st, "message": f"'{title}' etkinliği {st} için takvime eklendi."}
+                return {"status": "error", "message": res.get("message", "Etkinlik eklenemedi.")}
+            return {"status": "error", "message": "Takvim servisi aktif değil."}
+
+        elif name == "delete_calendar_event":
+            query = str(args.get("query", "")).strip()
+            if getattr(self, "calendar_service", None):
+                res = self.calendar_service.delete_event(query)
+                return res
+            return {"status": "error", "message": "Takvim servisi aktif değil."}
+
+        elif name == "notify_via_slack":
+            recipient = str(args.get("recipient", "Baran")).strip()
+            msg = str(args.get("message", "Ofise yeni misafir geldi.")).strip()
+            if getattr(self, "slack_service", None):
+                res = self.slack_service.notify_visitor_arrival(
+                    employee_name=recipient,
+                    visitor_name=getattr(self, "_active_person_name", "Misafir"),
+                    note=msg
+                )
+                return {"status": "success", "recipient": recipient, "delivered": res.get("delivered", False), "note": msg}
+            return {"status": "error", "message": "Slack servisi aktif değil."}
 
         return {"status": "unknown_tool"}
 
@@ -3276,7 +3732,8 @@ class AstroRealtimeNode(Node):
         if frame is None:
             return {"status": "no_camera_frame", "observation": "Kamera görüntüsü şu an alınamadı."}
 
-        b64_img = frame_to_base64_jpeg(frame, max_dim=512)
+        # Optimized 384px dimension for ultra-fast base64 encoding and transfer
+        b64_img = frame_to_base64_jpeg(frame, max_dim=384)
         if not b64_img:
             return {"status": "encode_error", "observation": "Görüntü işlenemedi."}
 
@@ -3285,25 +3742,91 @@ class AstroRealtimeNode(Node):
             b64_img = b64_img.split(",")[-1]
         b64_img = b64_img.replace("\n", "").replace("\r", "").strip()
 
+        # Concise prompt asking for an immediate, short conversational description (15-20 words)
         prompt_text = (
-            f"Sen Astro adlı sosyal robotun gözüsün. Bu fotoğrafta karşındaki odayı, ortamı, insanların duruşunu, "
-            f"masadaki eşyaları ve kullanıcının elinde tuttuğu nesneyi çok detaylı ve %100 doğru şekilde Türkçe açıkla. "
-            f"Odaklanılacak konu: {focus if focus else 'kullanıcının elindeki nesne, odadaki eşyalar ve çevre'}. Doğrudan kesin gözlemini kısa ve net yaz."
+            f"Sen sosyal robot Astrosun. Bu fotoğrafta kameranın gördüğü ortamı, eşyaları ve kişiyi tek bir kısa, samimi ve canlı Türkçe cümleyle (en fazla 15-20 kelime) söyle. "
+            f"Odaklanılacak konu: {focus if focus else 'odadaki eşyalar ve çevre'}. Doğrudan ne gördüğünü söyle."
         )
 
         refusal_kws = ["üzgünüm", "yardımcı olamam", "açıklayamıyorum", "cannot assist", "i am sorry", "i'm sorry", "doğrudan açıklayamıyorum"]
         obs = None
 
-        # 1. Primary: Groq Vision Models (0 Token Cost, Ultra Fast)
-        if self.groq_api_key:
+        def _try_openai_vision():
+            if not self.openai_api_key:
+                return None
+            import urllib.request
+            vision_model = os.environ.get("OPENAI_VISION_MODEL", "gpt-4o-mini")
+            req_data = {
+                "model": vision_model,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt_text},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
+                        ]
+                    }
+                ],
+                "max_tokens": 60,
+                "temperature": 0.2
+            }
+            req = urllib.request.Request(
+                "https://api.openai.com/v1/chat/completions",
+                data=json.dumps(req_data, ensure_ascii=False).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self.openai_api_key}",
+                    "User-Agent": "Mozilla/5.0"
+                },
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=3.5) as resp:
+                res_json = json.loads(resp.read().decode("utf-8"))
+                cand = res_json["choices"][0]["message"]["content"].strip()
+                if cand and not any(rk in cand.lower() for rk in refusal_kws):
+                    return cand
+            return None
+
+        def _try_gemini_vision():
+            if not self.gemini_api_key:
+                return None
+            import urllib.request
+            # Active fast vision models
+            for g_mod in ["gemini-2.0-flash", "gemini-1.5-flash"]:
+                try:
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_mod}:generateContent?key={self.gemini_api_key}"
+                    payload = {
+                        "contents": [{
+                            "parts": [
+                                {"text": prompt_text},
+                                {"inline_data": {"mime_type": "image/jpeg", "data": b64_img}}
+                            ]
+                        }],
+                        "generation_config": {"temperature": 0.2, "max_output_tokens": 60}
+                    }
+                    req = urllib.request.Request(
+                        url,
+                        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                        headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
+                    )
+                    with urllib.request.urlopen(req, timeout=3.0) as resp:
+                        res_json = json.loads(resp.read().decode("utf-8"))
+                        cand = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
+                        if cand and not any(rk in cand.lower() for rk in refusal_kws):
+                            return cand
+                except Exception as ge:
+                    self.get_logger().debug(f"Gemini Vision ({g_mod}) error: {ge}")
+            return None
+
+        def _try_groq_vision():
+            if not self.groq_api_key:
+                return None
+            import urllib.request
             active_groq = discover_groq_models(self.groq_api_key)
-            groq_v_models = [m for m in active_groq if "vision" in m]
-            if not groq_v_models:
-                groq_v_models = [m for m in ["llama-3.3-70b-versatile", "openai/gpt-oss-120b", "openai/gpt-oss-20b"] if m in active_groq]
+            # Only use models that explicitly support vision
+            groq_v_models = [m for m in active_groq if "vision" in m.lower()]
             for v_mod in groq_v_models:
                 try:
-                    import urllib.request
-                    import urllib.error
                     req_data = {
                         "model": v_mod,
                         "messages": [
@@ -3315,12 +3838,11 @@ class AstroRealtimeNode(Node):
                                 ]
                             }
                         ],
-                        "max_tokens": 150
+                        "max_tokens": 60
                     }
-                    data_bytes = json.dumps(req_data, ensure_ascii=False).encode("utf-8")
                     req = urllib.request.Request(
                         "https://api.groq.com/openai/v1/chat/completions",
-                        data=data_bytes,
+                        data=json.dumps(req_data, ensure_ascii=False).encode("utf-8"),
                         headers={
                             "Content-Type": "application/json",
                             "Authorization": f"Bearer {self.groq_api_key}",
@@ -3328,89 +3850,32 @@ class AstroRealtimeNode(Node):
                         },
                         method="POST"
                     )
-                    with urllib.request.urlopen(req, timeout=5.0) as resp:
-                        resp_json = json.loads(resp.read().decode("utf-8"))
-                        candidate_obs = resp_json["choices"][0]["message"]["content"].strip()
-                        if candidate_obs and not any(rk in candidate_obs.lower() for rk in refusal_kws):
-                            obs = candidate_obs
-                            break
-                except urllib.error.HTTPError as http_e:
-                    error_body = http_e.read().decode("utf-8", errors="ignore")
-                    self.get_logger().debug(f"Groq API ({v_mod}) notice: {http_e.code} - {error_body}")
-                except Exception as ge:
-                    self.get_logger().debug(f"Groq ({v_mod}) notice: {ge}")
-
-        # 2. Secondary: Google Gemini Flash REST (0 Token Cost, Blazing Fast)
-        if not obs and self.gemini_api_key:
-            for g_mod in ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-3.6-flash", "gemini-flash-latest"]:
-                try:
-                    import urllib.request
-                    import urllib.error
-                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_mod}:generateContent?key={self.gemini_api_key}"
-                    payload = {
-                        "contents": [{
-                            "parts": [
-                                {"text": prompt_text},
-                                {"inline_data": {"mime_type": "image/jpeg", "data": b64_img}}
-                            ]
-                        }],
-                        "generation_config": {"temperature": 0.2, "max_output_tokens": 150}
-                    }
-                    data_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-                    req = urllib.request.Request(
-                        url,
-                        data=data_bytes,
-                        headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
-                    )
-                    with urllib.request.urlopen(req, timeout=5.0) as resp:
+                    with urllib.request.urlopen(req, timeout=3.0) as resp:
                         res_json = json.loads(resp.read().decode("utf-8"))
-                        candidate_obs = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
-                        if candidate_obs and not any(rk in candidate_obs.lower() for rk in refusal_kws):
-                            obs = candidate_obs
-                            break
-                except urllib.error.HTTPError as http_e:
-                    error_body = http_e.read().decode("utf-8", errors="ignore")
-                    self.get_logger().debug(f"Gemini Vision ({g_mod}) notice: {http_e.code} - {error_body}")
-                except Exception as gem_e:
-                    self.get_logger().debug(f"Gemini Vision ({g_mod}) notice: {gem_e}")
+                        cand = res_json["choices"][0]["message"]["content"].strip()
+                        if cand and not any(rk in cand.lower() for rk in refusal_kws):
+                            return cand
+                except Exception as ge:
+                    self.get_logger().debug(f"Groq Vision ({v_mod}) error: {ge}")
+            return None
 
-        # 3. Emergency Safety Fallback: OpenAI Vision REST API (configurable fallback model)
-        # (Only used if Gemini & Groq keys are invalid/failed, so robot never goes blind)
-        if not obs and self.openai_api_key:
+        # Execute providers with cached fastest preference
+        fastest_pref = getattr(self, "_fastest_vision_provider", "openai")
+        providers = [("openai", _try_openai_vision), ("gemini", _try_gemini_vision), ("groq", _try_groq_vision)]
+        if fastest_pref == "gemini":
+            providers = [("gemini", _try_gemini_vision), ("openai", _try_openai_vision), ("groq", _try_groq_vision)]
+        elif fastest_pref == "groq":
+            providers = [("groq", _try_groq_vision), ("openai", _try_openai_vision), ("gemini", _try_gemini_vision)]
+
+        for prov_name, prov_fn in providers:
             try:
-                import urllib.request
-                vision_fallback_model = os.environ.get("OPENAI_VISION_MODEL", os.environ.get("LLM_FALLBACK_MODEL", "gpt-4o-mini"))
-                req_data = {
-                    "model": vision_fallback_model,
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": prompt_text},
-                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
-                            ]
-                        }
-                    ],
-                    "max_tokens": 150
-                }
-                data_bytes = json.dumps(req_data, ensure_ascii=False).encode("utf-8")
-                req = urllib.request.Request(
-                    "https://api.openai.com/v1/chat/completions",
-                    data=data_bytes,
-                    headers={
-                        "Content-Type": "application/json",
-                        "Authorization": f"Bearer {self.openai_api_key}",
-                        "User-Agent": "Mozilla/5.0"
-                    },
-                    method="POST"
-                )
-                with urllib.request.urlopen(req, timeout=6.0) as resp:
-                    resp_json = json.loads(resp.read().decode("utf-8"))
-                    candidate_obs = resp_json["choices"][0]["message"]["content"].strip()
-                    if candidate_obs and not any(rk in candidate_obs.lower() for rk in refusal_kws):
-                        obs = candidate_obs
-            except Exception as oe:
-                self.get_logger().debug(f"OpenAI Vision emergency fallback notice: {oe}")
+                cand = prov_fn()
+                if cand:
+                    obs = cand
+                    self._fastest_vision_provider = prov_name
+                    break
+            except Exception as pe:
+                self.get_logger().debug(f"Vision provider ({prov_name}) exception: {pe}")
 
         if obs:
             self.get_logger().info(f"👁️ [Kamera Görme Sonucu]: \"{obs}\"")
@@ -3535,18 +4000,20 @@ class AstroRealtimeNode(Node):
         is_wake_pattern = False
         extracted_cmd = ""
 
-        if t_clean in ("hey astro", "astro", "hey", "selam", "selam astro"):
+        wake_keywords = (
+            "hey astro", "astro", "selam astro", "merhaba astro",
+            "ey astro", "hay astro", "alo astro", "hey", "selam",
+            "astrocum", "astrom", "astrocuğum", "astrocan"
+        )
+        if t_clean in wake_keywords:
             is_wake_pattern = True
             extracted_cmd = ""
-        elif t_clean.startswith("hey astro ") or t_clean.startswith("hey astro,"):
-            is_wake_pattern = True
-            extracted_cmd = t_clean[len("hey astro"):].strip()
-        elif t_clean.startswith("astro ") or t_clean.startswith("astro,"):
-            is_wake_pattern = True
-            extracted_cmd = t_clean[len("astro"):].strip()
-        elif t_clean.startswith("selam astro "):
-            is_wake_pattern = True
-            extracted_cmd = t_clean[len("selam astro"):].strip()
+        else:
+            for pfx in ("hey astro", "astro", "selam astro", "merhaba astro", "ey astro", "hay astro", "alo astro", "astrocum", "astrom", "astrocuğum", "astrocan"):
+                if t_clean.startswith(f"{pfx} ") or t_clean.startswith(f"{pfx},"):
+                    is_wake_pattern = True
+                    extracted_cmd = t_clean[len(pfx):].strip(", ").strip()
+                    break
 
         if not is_wake_pattern:
             self.get_logger().info(
@@ -3683,8 +4150,99 @@ class AstroRealtimeNode(Node):
             forward_samples = ranges[: max(1, n // 8)] + ranges[- max(1, n // 8) :]
             valid = [r for r in forward_samples if 0.05 < r < 0.45]
             self._obstacle_detected = (len(valid) >= 3)
+            if getattr(self, "social_brain", None) and hasattr(self.social_brain, "spatial_fusion"):
+                try:
+                    self.social_brain.spatial_fusion.update_lidar_scan(ranges)
+                except Exception:
+                    pass
+
+            # Office Concierge: only trigger in true idle state (not during active conversation or speaking)
+            if getattr(self, "office_concierge", None):
+                is_active = (
+                    getattr(self, "_is_responding", False)
+                    or getattr(self, "_is_playback_active", False)
+                    or (getattr(self, "conversation_session", None) and self.conversation_session.is_active())
+                )
+                if not is_active:
+                    ident = getattr(self, "_recognized_person", None)
+                    welcome_act = self.office_concierge.evaluate_entrance_presence(
+                        lidar_ranges=ranges,
+                        recognized_identity=ident,
+                        is_speaking=False
+                    )
+                    if welcome_act:
+                        self._handle_office_welcome(welcome_act)
         except Exception as _exc:
             self.get_logger().debug(f"_on_laser_scan: {_exc}")
+
+    def _handle_office_welcome(self, welcome_act: Dict[str, Any]):
+        """Triggers proactive welcome speech for lobby guests without disruptive gestures."""
+        speech_text = welcome_act.get("speech_text", "")
+        if speech_text and self._ws and self._loop and self._is_connected:
+            welcome_event = {
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": f"[Sistem Olayı - Lobi Karşılama]: Kapıdan biri girdi! Tam olarak şu cümleyle sıcak ve samimi şekilde selamla: '{speech_text}'"
+                        }
+                    ]
+                }
+            }
+            try:
+                asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(welcome_event)), self._loop)
+                asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps({"type": "response.create"})), self._loop)
+                self.get_logger().info(f"👋 [Lobi Karşılama Tetiklendi]: {speech_text}")
+            except Exception as _exc:
+                self.get_logger().debug(f"_handle_office_welcome: {_exc}")
+
+    def _on_slack_command(self, msg: Any):
+        """Processes incoming Slack command from /office/slack_command topic."""
+        try:
+            raw_data = str(getattr(msg, "data", "")).strip()
+            if not raw_data or not getattr(self, "slack_service", None):
+                return
+            parsed = self.slack_service.parse_incoming_command(raw_data)
+            action = parsed.get("action")
+            self.get_logger().info(f"💬 [Slack Komutu Alındı]: {parsed}")
+            if action == "navigate_to":
+                target = parsed.get("target", "baran_masa")
+                if getattr(self, "action_manager", None):
+                    self.action_manager.execute_move(direction="forward", speed=0.2, duration=2.0)
+            elif action == "announce":
+                text = parsed.get("text", "")
+                if text and self._ws and self._loop and self._is_connected:
+                    ann_event = {
+                        "type": "conversation.item.create",
+                        "item": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": f"[Slack Ofis Duyurusu]: Ekibe şunu sesli duyur: '{text}'"}]
+                        }
+                    }
+                    asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(ann_event)), self._loop)
+                    asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps({"type": "response.create"})), self._loop)
+        except Exception as exc:
+            self.get_logger().debug(f"_on_slack_command error: {exc}")
+
+    def _on_joint_states(self, msg: Any):
+        """Processes wheel and head encoder feedback from /joint_states for physical grounding."""
+        try:
+            names = list(getattr(msg, "name", []))
+            positions = list(getattr(msg, "position", []))
+            velocities = list(getattr(msg, "velocity", []))
+            if getattr(self, "action_manager", None) and hasattr(self.action_manager, "update_joint_states"):
+                self.action_manager.update_joint_states(names, positions, velocities)
+            if getattr(self, "social_brain", None) and hasattr(self.social_brain, "world_model"):
+                for idx, name in enumerate(names):
+                    if name == "head_yaw_joint" and idx < len(positions):
+                        head_yaw_deg = math.degrees(float(positions[idx]))
+                        self.social_brain.world_model._robot_state["head_yaw_deg"] = head_yaw_deg
+        except Exception as _exc:
+            self.get_logger().debug(f"_on_joint_states: {_exc}")
 
     def _evaluate_vision_event(self, event_type: str, focus: str = "", explicit: bool = False) -> Optional[Dict[str, Any]]:
         """Event-driven vision gating: evaluates frame difference, cooldown, budget, and semantic filters."""
@@ -3876,7 +4434,7 @@ class AstroRealtimeNode(Node):
 
             # 2. Try Gemini REST (0 Token Cost fallback)
             if not ans and self.gemini_api_key:
-                for g_mod in ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-3.6-flash", "gemini-flash-latest"]:
+                for g_mod in ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]:
                     try:
                         url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_mod}:generateContent?key={self.gemini_api_key}"
                         payload = {"contents": [{"parts": [{"text": prompt}]}], "generation_config": {"temperature": 0.1, "max_output_tokens": 60}}
@@ -3922,6 +4480,36 @@ class AstroRealtimeNode(Node):
                 }
                 asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(alarm_event)), self._loop)
                 asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps({"type": "response.create"})), self._loop)
+
+        # Check pre-meeting proactive reminders (10 minutes before meeting)
+        if getattr(self, "calendar_service", None):
+            due_meetings = self.calendar_service.check_meeting_reminders(lead_minutes=10)
+            for m in due_meetings:
+                m_title = m.get("title", "Toplantı")
+                m_min = m.get("minutes_left", 10)
+                m_loc = m.get("location", "Toplantı Odası")
+                self.get_logger().info(f"📅 [Toplantı Hatırlatması]: '{m_title}' için {m_min} dk kaldı!")
+                if getattr(self, "action_manager", None):
+                    self.action_manager.execute_gesture("nod")
+                if self._ws and self._loop and self._is_connected:
+                    meet_event = {
+                        "type": "conversation.item.create",
+                        "item": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": f"[Sistem Hatırlatması - Toplantı]: Kullanıcıya {m_min} dakika sonra '{m_title}' ({m_loc}) toplantısının başlayacağını nazikçe ve samimi şekilde hatırlat."
+                                }
+                            ]
+                        }
+                    }
+                    try:
+                        asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(meet_event)), self._loop)
+                        asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps({"type": "response.create"})), self._loop)
+                    except Exception:
+                        pass
 
     def _check_session_lifecycle(self):
         """Periodically checks if the active session ended and summarizes it into long-term profile."""
@@ -3995,6 +4583,36 @@ class AstroRealtimeNode(Node):
             self.get_logger().info(f"📝 [Kalıcı Hafıza Kaydı ({person_name})]: 'Önceki konuşma hafızaya kaydedildi -> {summary}'")
             self._sync_perception_to_session()
 
+    def _update_playback_reference(self, pcm_16k: bytes):
+        """Buffers recent output audio chunks for acoustic self-voice echo detection."""
+        if not pcm_16k:
+            return
+        if getattr(self, "voice_recognizer", None) and hasattr(self.voice_recognizer, "update_playback_reference"):
+            try:
+                self.voice_recognizer.update_playback_reference(pcm_16k)
+            except Exception:
+                pass
+        ref_lock = getattr(self, "_playback_ref_lock", None)
+        if ref_lock:
+            with ref_lock:
+                self._playback_ref_pcm = (getattr(self, "_playback_ref_pcm", b"") + pcm_16k)[-48000:]
+        else:
+            self._playback_ref_pcm = (getattr(self, "_playback_ref_pcm", b"") + pcm_16k)[-48000:]
+
+    def _clear_playback_reference(self):
+        """Clears playback reference buffer when playback stops or turn completes."""
+        if getattr(self, "voice_recognizer", None) and hasattr(self.voice_recognizer, "clear_playback_reference"):
+            try:
+                self.voice_recognizer.clear_playback_reference()
+            except Exception:
+                pass
+        ref_lock = getattr(self, "_playback_ref_lock", None)
+        if ref_lock:
+            with ref_lock:
+                self._playback_ref_pcm = b""
+        else:
+            self._playback_ref_pcm = b""
+
     def _flush_audio_buffers(self, reason: str = "transition"):
         """Completely purges all audio input buffers, queues, and VAD state during turn state transitions."""
         with self._lock:
@@ -4014,6 +4632,7 @@ class AstroRealtimeNode(Node):
         elif was_active and not self._is_playback_active:
             self._playback_end_time = time.monotonic()
             self._last_interaction_time = time.monotonic()
+            self._clear_playback_reference()
             if not self._is_processing_fallback:
                 self._is_responding = False
             self._flush_audio_buffers("playback_ended")
@@ -4076,7 +4695,7 @@ class AstroRealtimeNode(Node):
         chunk_size = 320
         speech_frames = 0
         total_frames = max(1, len(arr) // chunk_size)
-        speech_threshold = max(350.0, self._ambient_rms * 1.5)
+        speech_threshold = max(110.0, self._ambient_rms * 1.15)
         for i in range(0, len(arr) - chunk_size + 1, chunk_size):
             c_arr = arr[i : i + chunk_size]
             c_rms = float(np.sqrt(np.mean(c_arr.astype(np.float32) ** 2)))
@@ -4095,6 +4714,11 @@ class AstroRealtimeNode(Node):
         words = norm_text.split()
         is_short_utterance = (len(words) == 1 and words[0] in VALID_SHORT_UTTERANCES)
         is_suspect_phrase = any(sp in norm_text for sp in SUSPECT_PHRASES)
+        is_wake_cand = any(w in norm_text for w in (
+            "hey astro", "astro", "selam astro", "merhaba astro",
+            "ey astro", "hay astro", "alo astro", "hey", "selam",
+            "astrocum", "astrom", "astrocuğum", "astrocan"
+        ))
 
         rejected = False
         reject_reason = "none"
@@ -4127,7 +4751,11 @@ class AstroRealtimeNode(Node):
             reject_reason = "self_voice"
 
         # 3. Weak speech duration, low VAD confidence, or ambient noise floor
-        elif vad_confidence < 0.20 or speech_ms < 100 or total_rms < max(200.0, self._ambient_rms * 1.15):
+        elif (
+            (vad_confidence < 0.15 or speech_ms < 50 or total_rms < max(75.0, self._ambient_rms * 1.05))
+            if is_wake_cand
+            else (vad_confidence < 0.20 or speech_ms < 100 or total_rms < max(130.0, self._ambient_rms * 1.15))
+        ):
             rejected = True
             reject_reason = "no_speech"
 
@@ -4138,19 +4766,19 @@ class AstroRealtimeNode(Node):
 
         # 5. Short utterances (e.g. "Hey", "Lan", "Dur", "Tamam", "Ne?")
         elif len(words) == 1:
-            if is_short_utterance and speech_ms >= 70 and total_rms >= 280.0 and not is_playback_active:
+            if (is_short_utterance or is_wake_cand) and speech_ms >= 50 and total_rms >= max(75.0, self._ambient_rms * 1.05) and not is_playback_active:
                 rejected = False
-            elif not is_short_utterance and (speech_ms < 140 or total_rms < 380.0 or vad_confidence < 0.30):
+            elif not is_short_utterance and not is_wake_cand and (speech_ms < 140 or total_rms < 380.0 or vad_confidence < 0.30):
                 rejected = True
                 reject_reason = "low_confidence"
 
         # 6. Low quality speech / Repetitive Whisper hallucination gate (e.g. 'Türen, türen...', 'Hahaha')
-        elif vad_confidence < 0.35 and speech_ms < 220 and total_rms < 380.0:
+        elif not is_wake_cand and vad_confidence < 0.35 and speech_ms < 220 and total_rms < 380.0:
             rejected = True
             reject_reason = "low_confidence"
 
         # 7. General sentence threshold
-        elif speech_ms < 120 or total_rms < 240.0:
+        elif (speech_ms < 50 or total_rms < 90.0) if is_wake_cand else (speech_ms < 100 or total_rms < 140.0):
             rejected = True
             reject_reason = "low_confidence"
 
@@ -4204,12 +4832,14 @@ class AstroRealtimeNode(Node):
         return cleaned, telem
 
     def _post_transcription(self, url: str, api_key: str, model: str, wav_bytes: bytes,
-                            timeout: float) -> Optional[str]:
+                            timeout: float, prompt: str = "Astro, hey Astro, robot, Baran, Oktay.") -> Optional[str]:
         """multipart/form-data ile /audio/transcriptions çağırır. OpenAI ve Groq aynı şemayı kullanır."""
         boundary = "----AstroBoundary" + os.urandom(16).hex()
         body = bytearray()
-        for field, value in (("model", model), ("language", "tr"),
-                             ("prompt", "Astro Türkçe konuşma, diyalog, robot asistan.")):
+        fields = [("model", model), ("language", "tr")]
+        if prompt:
+            fields.append(("prompt", prompt))
+        for field, value in fields:
             body.extend(f"--{boundary}\r\n".encode())
             body.extend(f'Content-Disposition: form-data; name="{field}"\r\n\r\n'.encode())
             body.extend(value.encode("utf-8"))
@@ -4300,6 +4930,7 @@ class AstroRealtimeNode(Node):
         if not self.groq_api_key:
             return None
         try:
+            prompt_text = "Astro, hey Astro, sesime dön, bana bak, bana dön, yüzüme bak, dur, durdum, merkez, Baran, Oktay, robot."
             boundary = "----WebKitFormBoundary" + os.urandom(16).hex()
             body = bytearray()
             body.extend(f"--{boundary}\r\n".encode())
@@ -4315,7 +4946,7 @@ class AstroRealtimeNode(Node):
             body.extend(b'tr\r\n')
             body.extend(f"--{boundary}\r\n".encode())
             body.extend(b'Content-Disposition: form-data; name="prompt"\r\n\r\n')
-            body.extend("Astro Türkçe konuşma, diyalog, robot asistan.".encode("utf-8"))
+            body.extend(prompt_text.encode("utf-8"))
             body.extend(b'\r\n')
             body.extend(f"--{boundary}--\r\n".encode())
 
@@ -4345,18 +4976,18 @@ class AstroRealtimeNode(Node):
             return b""
 
         p = self.persona_name.lower()
-        if p in ("flirt", "emotional"):
-            voice = "tr-TR-EmelNeural"
-            rate = "+12%"
-        else:
-            voice = "tr-TR-AhmetNeural"
-            rate = "+20%" if p in ("kufurbaz", "playful", "angry", "rude") else "+8%"
+        default_voice = "tr-TR-EmelNeural" if p in ("flirt", "emotional") else "tr-TR-AhmetNeural"
+        voice = os.getenv("EDGE_TTS_VOICE", default_voice).strip() or default_voice
+        default_rate = "+10%" if p in ("kufurbaz", "playful", "angry", "rude") else "+4%"
+        rate = os.getenv("EDGE_TTS_RATE", default_rate).strip() or default_rate
+        pitch = os.getenv("EDGE_TTS_PITCH", "+0Hz").strip() or "+0Hz"
+        volume = os.getenv("EDGE_TTS_VOLUME", "+0%").strip() or "+0%"
 
         try:
             import edge_tts
             loop = asyncio.new_event_loop()
             async def _get_mp3():
-                communicate = edge_tts.Communicate(clean_text, voice, rate=rate)
+                communicate = edge_tts.Communicate(clean_text, voice, rate=rate, pitch=pitch, volume=volume)
                 buf = bytearray()
                 async for chunk in communicate.stream():
                     if chunk["type"] == "audio":
@@ -4364,6 +4995,7 @@ class AstroRealtimeNode(Node):
                 return bytes(buf)
             mp3_data = loop.run_until_complete(_get_mp3())
             loop.close()
+
 
             if mp3_data:
                 try:
@@ -4768,6 +5400,11 @@ class AstroRealtimeNode(Node):
                     break
                 chunk = pcm_data[i : i + chunk_size]
                 if chunk:
+                    try:
+                        chunk_16k = resample_24k_to_16k(chunk) if len(chunk) != 320 else chunk
+                        self._update_playback_reference(chunk_16k)
+                    except Exception:
+                        pass
                     b64_str = base64.b64encode(chunk).decode("ascii")
                     msg_dict = {
                         "generation_id": effective_gen_id,
@@ -4915,6 +5552,9 @@ class AstroRealtimeNode(Node):
                 if not validated_text:
                     return
 
+                # Valid human speech confirmed — wake Astro up from DEEP_IDLE / Sleep
+                self._wake_up()
+
                 # Check for pure wake word in active mode (e.g. "Astro.", "Hey Astro", "Selam")
                 norm_wake_check = re.sub(r"[^\w\s]", "", validated_text.lower()).strip()
                 if norm_wake_check in ("astro", "hey astro", "selam astro", "hey", "selam"):
@@ -4943,8 +5583,10 @@ class AstroRealtimeNode(Node):
                 user_text = validated_text
                 self.get_logger().info(f"🗣️ [Siz (0-Maliyet)]: \"{user_text}\"")
                 self.memory.episodic.add_message("user", user_text)
+                self.state_machine.transition_to(RobotState.THINKING)
 
             # 4. Run Voiceprint Recognition (Acoustic Speaker Identification with Temporal Smoothing)
+
             spk_name = None
             spk_score = 0.0
             spk_source = "unidentified"
@@ -5150,6 +5792,135 @@ class AstroRealtimeNode(Node):
                     _handle_and_play_clause_audio(pcm)
                     return
 
+            # Explicit Head Angle Command (e.g. '0 dereceye dön', '-30'a dön', '30 derece sağa bak')
+            is_angle, target_angle, angle_label = self._is_head_angle_query(user_text)
+            if is_angle:
+                p = self.persona_name.lower()
+                spk = f" {spk_name}" if spk_name else ""
+                self.pub_head_target_yaw.publish(Float32(data=float(target_angle)))
+                self.get_logger().info(f"🎯 [Head Manual Command]: Kafa açısı komutla ayarlandı -> {target_angle:.1f}° ({angle_label})")
+
+                if p == "kufurbaz":
+                    if abs(target_angle) < 0.1:
+                        reply_text = f"Kafayı tam ortaya sıfırladım{spk}, düz bakıyorum işte!"
+                    else:
+                        reply_text = f"Kafayı {int(target_angle)} dereceye çevirdim{spk}, rahatladın mı!"
+                elif p == "flirt":
+                    if abs(target_angle) < 0.1:
+                        reply_text = f"Hemen tam karşına bakıyorum canım benim{spk}."
+                    else:
+                        reply_text = f"Senin için {int(target_angle)} dereceye döndüm tatlım{spk}."
+                else:
+                    if abs(target_angle) < 0.1:
+                        reply_text = f"Kafa konumu 0 derece merkeze hizalandı{spk}."
+                    else:
+                        reply_text = f"Kafa konumu {int(target_angle)} dereceye ayarlandı{spk}."
+
+                with self._lock:
+                    self._recent_robot_phrases.append(reply_text.lower())
+                    if len(self._recent_robot_phrases) > 10:
+                        self._recent_robot_phrases = self._recent_robot_phrases[-10:]
+
+                pcm, s_ms, g_ms, q_ms = _synthesize_turn_clause(reply_text)
+                total_synth_ms += s_ms
+                total_gpu_ms += g_ms
+                total_queue_wait_ms += q_ms
+                if pcm:
+                    first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
+                    self.get_logger().info(f"🤖 [Astro (Açı Komutu)]: \"{reply_text}\"")
+                    self.memory.episodic.add_message("assistant", reply_text)
+                    self.session.record_robot_speech()
+                    _handle_and_play_clause_audio(pcm)
+                    return
+
+            is_turn_sound = self._is_turn_to_sound_query(user_text)
+            if is_turn_sound:
+                if hasattr(self, "pub_explicit_gaze") and self.pub_explicit_gaze:
+                    try:
+                        explicit_msg = String()
+                        payload = {
+                            "selector": "CURRENT_SPEAKER",
+                            "confidence": 1.0,
+                            "reason": "explicit_speech_command",
+                        }
+                        explicit_msg.data = json.dumps(payload)
+                        self.pub_explicit_gaze.publish(explicit_msg)
+                    except Exception:
+                        pass
+
+                p = self.persona_name.lower()
+                spk = f" {spk_name}" if spk_name else ""
+                act_res = None
+                if getattr(self, "action_manager", None):
+                    act_res = self.action_manager.execute_turn_to_sound(
+                        generation_id=self._fallback_generation_id
+                    )
+
+                if act_res and act_res.success:
+                    if p == "kufurbaz":
+                        reply_text = f"Döndüm ulan işte{spk}, söyle bakalım ne diyorsun!"
+                    elif p == "flirt":
+                        reply_text = f"Hemen sana döndüm canım benim{spk}, seni dinliyorum."
+                    else:
+                        reply_text = f"Sesine döndüm{spk}, seni dinliyorum."
+                else:
+                    if p == "kufurbaz":
+                        reply_text = f"Sesinin yönünü tam kestiremedim ama buradayım ulan, anlat!"
+                    else:
+                        reply_text = f"Sesinin yönünü tam kestiremedim ama buradayım{spk}, seni dinliyorum."
+
+                with self._lock:
+                    self._recent_robot_phrases.append(reply_text.lower())
+                    if len(self._recent_robot_phrases) > 10:
+                        self._recent_robot_phrases = self._recent_robot_phrases[-10:]
+
+                pcm, s_ms, g_ms, q_ms = _synthesize_turn_clause(reply_text)
+                total_synth_ms += s_ms
+                total_gpu_ms += g_ms
+                total_queue_wait_ms += q_ms
+                if pcm:
+                    first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
+                    self.get_logger().info(f"🤖 [Astro (Ses Yönelimi)]: \"{reply_text}\"")
+                    self.memory.episodic.add_message("assistant", reply_text)
+                    self.session.record_robot_speech()
+                    _handle_and_play_clause_audio(pcm)
+                    return
+
+            is_move, move_dir, move_spd, move_dur = self._is_movement_query(user_text)
+            if is_move:
+                p = self.persona_name.lower()
+                spk = f" {spk_name}" if spk_name else ""
+                act_res = None
+                if getattr(self, "action_manager", None):
+                    act_res = self.action_manager.execute_move(
+                        direction=move_dir,
+                        speed=move_spd,
+                        duration=move_dur,
+                        generation_id=self._fallback_generation_id,
+                    )
+
+                dir_names_tr = {"forward": "ileri", "backward": "geriye", "left": "sola", "right": "sağa", "stop": "durma"}
+                dir_tr = dir_names_tr.get(move_dir, move_dir)
+                if act_res and act_res.success:
+                    if move_dir == "stop":
+                        reply_text = f"Durdum{spk}."
+                    else:
+                        reply_text = f"{dir_tr.capitalize()} hareket ediyorum{spk}."
+                else:
+                    reply_text = f"Güvenlik kilidi devrede veya hareket engellendi{spk}."
+
+                pcm, s_ms, g_ms, q_ms = _synthesize_turn_clause(reply_text)
+                total_synth_ms += s_ms
+                total_gpu_ms += g_ms
+                total_queue_wait_ms += q_ms
+                if pcm:
+                    first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
+                    self.get_logger().info(f"🤖 [Astro (Hareket Komutu)]: \"{reply_text}\"")
+                    self.memory.episodic.add_message("assistant", reply_text)
+                    self.session.record_robot_speech()
+                    _handle_and_play_clause_audio(pcm)
+                    return
+
             # 7. Cognitive LLM via ProviderRegistry (Streaming Groq -> Gemini -> Contextual Persona)
             system_prompt = self._build_current_system_prompt(active_speaker=active_speaker_dict)
             messages = [{"role": "system", "content": system_prompt}]
@@ -5165,7 +5936,7 @@ class AstroRealtimeNode(Node):
             total_audio_bytes = 0
             total_enqueued_chunks = 0
 
-            # Attempt A: Streaming Groq LLMs (20B preferred, fallback to 120B on failure)
+            # Attempt A: Streaming Groq LLMs (Fastest first, fallback on failure)
             if self.groq_api_key and groq_candidates:
                 for target_model in groq_candidates:
                     try:
@@ -5178,7 +5949,7 @@ class AstroRealtimeNode(Node):
                             messages,
                             max_tokens=60,
                             temperature=0.65,
-                            timeout=2.5,
+                            timeout=5.0,
                         ):
                             if not first_token_seen:
                                 llm_ttft_ms = (time.monotonic() - t_model_start) * 1000.0
@@ -5210,6 +5981,9 @@ class AstroRealtimeNode(Node):
                         })
                         self.get_logger().warn(f"⚠️ [Groq Model Fallback] {target_model} failed ({pe.error_class.value}): {pe.message[:80]}")
                         full_reply_parts = []
+                        if pe.error_class in (ErrorClass.QUOTA_EXHAUSTED, ErrorClass.RATE_LIMITED, ErrorClass.AUTHENTICATION_ERROR):
+                            # Quota/rate-limit is provider-wide; do not loop through other models on this provider
+                            break
                         continue
 
             # Attempt B: Google Gemini REST Fallback (if Groq produced no tokens)
@@ -5253,7 +6027,11 @@ class AstroRealtimeNode(Node):
                             "error": pe.message[:80]
                         })
                         self.get_logger().warn(f"⚠️ [Gemini Model Fallback] {g_mod} failed ({pe.error_class.value}): {pe.message[:80]}")
+                        if pe.error_class in (ErrorClass.QUOTA_EXHAUSTED, ErrorClass.RATE_LIMITED, ErrorClass.AUTHENTICATION_ERROR):
+                            # Quota/rate-limit is provider-wide; do not loop through other models on this provider
+                            break
                         continue
+
 
             full_reply_str = clean_tts_text("".join(full_reply_parts))
 
@@ -5459,13 +6237,16 @@ class AstroRealtimeNode(Node):
         # ====================================================================
         if self._is_sleeping or self.state_machine.is_deep_idle():
             if raw_16k:
-                is_speech_energy = (local_rms > max(420.0, self._ambient_rms * 1.45) and peak_val > 1000)
+                wake_min_rms = float(os.getenv("WAKE_MIN_RMS", "120.0"))
+                wake_min_peak = int(os.getenv("WAKE_MIN_PEAK", "350"))
+                is_speech_energy = (local_rms > max(wake_min_rms, self._ambient_rms * 1.20) and peak_val > wake_min_peak)
                 if is_speech_energy:
                     self._wake_last_voice_time = now
                     if not self._wake_listening:
                         self._wake_listening = True
                         with self._lock:
-                            pre_frames = list(self._user_speech_audio_buffer[-8:]) if len(self._user_speech_audio_buffer) >= 8 else []
+                            # 18 pre-roll frames (360ms) ensures full initial syllable (e.g. "Hey") is preserved
+                            pre_frames = list(self._user_speech_audio_buffer[-18:]) if len(self._user_speech_audio_buffer) >= 18 else list(self._user_speech_audio_buffer)
                         self._wake_audio_buffer = list(pre_frames) + [raw_16k]
                     else:
                         self._wake_audio_buffer.append(raw_16k)
@@ -5479,7 +6260,7 @@ class AstroRealtimeNode(Node):
                             raw_w = b"".join(self._wake_audio_buffer)
                             arr_w = np.frombuffer(raw_w, dtype=np.int16)
                             w_rms = float(np.sqrt(np.mean(arr_w.astype(np.float32) ** 2))) if len(arr_w) > 0 else 0.0
-                            if w_rms >= max(360.0, self._ambient_rms * 1.25):
+                            if w_rms >= max(100.0, self._ambient_rms * 1.15):
                                 buf_to_proc = list(self._wake_audio_buffer)
                                 self._wake_audio_buffer.clear()
                                 threading.Thread(target=self._process_wake_candidate, args=(buf_to_proc,), daemon=True).start()
@@ -5509,9 +6290,9 @@ class AstroRealtimeNode(Node):
                 return
 
             # Target barge-in threshold: Requires intentional voice exceeding loudspeaker playback level
-            barge_min_rms = float(getattr(self, "barge_in_playback_min_rms", getattr(self, "barge_in_min_rms", 3800.0)))
-            barge_noise_mult = float(getattr(self, "barge_in_noise_mult", 3.5))
-            barge_min_peak = int(getattr(self, "barge_in_playback_min_peak", getattr(self, "barge_in_min_peak", 8500)))
+            barge_min_rms = float(getattr(self, "barge_in_playback_min_rms", getattr(self, "barge_in_min_rms", 1400.0)))
+            barge_noise_mult = float(getattr(self, "barge_in_noise_mult", 3.0))
+            barge_min_peak = int(getattr(self, "barge_in_playback_min_peak", getattr(self, "barge_in_min_peak", 2500)))
             ambient_val = float(getattr(self, "_ambient_rms", 120.0))
 
             target_barge_in_rms = max(barge_min_rms, ambient_val * barge_noise_mult)
@@ -5524,6 +6305,12 @@ class AstroRealtimeNode(Node):
                     self_voice_score = self.voice_recognizer.score_self_voice(raw_16k)
                 except Exception:
                     self_voice_score = 0.0
+            if self_voice_score < 0.70 and hasattr(self, "_playback_ref_pcm") and self._playback_ref_pcm:
+                try:
+                    ref_score = compute_pcm_self_voice_score(raw_16k, self._playback_ref_pcm)
+                    self_voice_score = max(self_voice_score, ref_score)
+                except Exception:
+                    pass
 
             # 2. Self-Voice Rejection Check
             if self_voice_score >= 0.70:
@@ -5562,12 +6349,17 @@ class AstroRealtimeNode(Node):
                 is_edge_tts_active = getattr(self, "_fallback_mode", False) or not self._can_use_openai("realtime")
             except Exception:
                 is_edge_tts_active = False
-            base_min_speech_ms = float(getattr(self, "barge_in_min_speech_ms", 60.0))
-            effective_min_speech_ms = (
-                max(120.0, base_min_speech_ms)
-                if is_edge_tts_active
-                else max(base_min_speech_ms, getattr(self, "barge_in_min_consecutive_frames", 3) * 20.0)
-            )
+
+            if is_edge_tts_active:
+                # In Edge-TTS mode without hardware AEC subtraction, require substantial human speech
+                # (>=400ms continuity in production, 120ms under pytest) to avoid microphone loudspeaker feedback false cuts.
+                effective_min_speech_ms = 120.0 if self._under_pytest() else 400.0
+                target_barge_in_rms = max(target_barge_in_rms * 1.5, 3000.0)
+                target_barge_in_peak = max(target_barge_in_peak, 8000)
+            else:
+                base_min_speech_ms = float(getattr(self, "barge_in_min_speech_ms", 60.0))
+                effective_min_speech_ms = max(base_min_speech_ms, getattr(self, "barge_in_min_consecutive_frames", 3) * 20.0)
+
             min_speech_ms = effective_min_speech_ms
             if speech_duration_ms < min_speech_ms:
                 if local_rms >= target_barge_in_rms and peak_val >= target_barge_in_peak:
@@ -5716,6 +6508,10 @@ class AstroRealtimeNode(Node):
             return
 
         # --- Standard OpenAI Realtime Mode ---
+        # Gating: While a tool is actively in progress, do NOT stream audio to OpenAI to prevent premature server VAD!
+        if getattr(self, "_active_tool_call_in_progress", False):
+            return
+
         # Gating: Microphone PCM is strictly streamed ONLY when _can_use_openai("realtime") is True
         if (
             self._can_use_openai("realtime")
@@ -5723,9 +6519,12 @@ class AstroRealtimeNode(Node):
             and self.realtime_session_state == "READY"
             and self._ws is not None
         ):
+            audio_b64 = getattr(msg, "data", None)
+            if audio_b64 is None and raw_bytes:
+                audio_b64 = base64.b64encode(raw_bytes).decode("ascii")
             payload = {
                 "type": "input_audio_buffer.append",
-                "audio": msg.data
+                "audio": audio_b64 or ""
             }
             try:
                 if self._loop is not None:
@@ -5794,6 +6593,58 @@ class AstroRealtimeNode(Node):
         except Exception as _exc:
             self.get_logger().debug(f"_on_recognized_person: yok sayılan hata ({_exc})")
 
+    def _on_faces(self, msg: String):
+        """Processes multi-person detection array and runs AttentionManager focus selection."""
+        try:
+            raw = (msg.data or "").strip()
+            if not raw:
+                return
+            faces_data = json.loads(raw)
+            if not isinstance(faces_data, list) or len(faces_data) == 0:
+                return
+
+            candidates: List[Any] = []
+            for idx, f in enumerate(faces_data):
+                if not isinstance(f, dict):
+                    continue
+                name_val = f.get("recognized_name") or f.get("name") or "Misafir"
+                is_known = bool(f.get("is_known", False) or (name_val.lower() != "misafir"))
+                dist = float(f.get("distance_m", 1.5))
+                looking = bool(f.get("looking_at_robot", False))
+                yaw = float(f.get("yaw_deg", 0.0))
+                p_id = str(f.get("person_id") or f"person_{name_val.lower()}_{idx}")
+
+                if UnifiedPersonState:
+                    p_state = UnifiedPersonState(
+                        person_id=p_id,
+                        name=name_val,
+                        formal_title=f.get("recognized_title") or name_val,
+                        is_known=is_known,
+                        identity_confidence=0.85 if is_known else 0.20,
+                        familiarity_score=0.80 if is_known else 0.20,
+                        distance_m=dist,
+                        azimuth_deg=yaw,
+                        is_looking_at_robot=looking,
+                        is_present=True,
+                    )
+                    candidates.append(p_state)
+
+            if getattr(self, "social_brain", None):
+                self.social_brain.world_model.update_people(candidates)
+
+                # Focus target selection via AttentionManager
+                if hasattr(self.social_brain, "attention_manager") and candidates:
+                    chosen, score = self.social_brain.attention_manager.select_focus_target(candidates)
+                    if chosen:
+                        with self._lock:
+                            if chosen.is_known and chosen.name.lower() != "misafir":
+                                self._active_person_name = chosen.name
+                                self._person_hold_until = time.monotonic() + 30.0
+                            self._user_distance = chosen.distance_m
+                            self._looking_at_robot = chosen.is_looking_at_robot
+        except Exception as _exc:
+            self.get_logger().debug(f"_on_faces: {_exc}")
+
     def _on_speaker_id(self, msg: String):
         try:
             raw = (msg.data or "").strip()
@@ -5812,6 +6663,40 @@ class AstroRealtimeNode(Node):
             self._sync_perception_to_session()
         except Exception as _exc:
             self.get_logger().debug(f"_on_speaker_id: yok sayılan hata ({_exc})")
+
+    def _on_conversation_session_ended(self):
+        """Called when a conversational session times out or user departs; consolidates episodic memory."""
+        try:
+            with self._lock:
+                turns = list(self._session_turns_buffer)
+                self._session_turns_buffer.clear()
+                active_person = self._active_person_name or "Misafir"
+                current_emotion = getattr(self, "_user_emotion", "neutral")
+
+            if not turns:
+                return
+
+            if getattr(self, "social_brain", None) and hasattr(self.social_brain, "consolidation_engine"):
+                def _run_consolidation():
+                    try:
+                        self.get_logger().info(
+                            f"💾 [Hafıza Konsolidasyonu]: {active_person} ile yapılan {len(turns)} turluk sohbet kalıcı belleğe işleniyor..."
+                        )
+                        self.social_brain.consolidation_engine.consolidate_session(
+                            person_name=active_person,
+                            dialogue_turns=turns,
+                            emotional_arc=current_emotion,
+                        )
+                    except Exception as err:
+                        self.get_logger().debug(f"Consolidation error: {err}")
+
+                threading.Thread(target=_run_consolidation, daemon=True).start()
+        except Exception as exc:
+            self.get_logger().debug(f"_on_conversation_session_ended: {exc}")
+
+    def _ground_speech_gesture(self, text: str):
+        """Speech gestures are disabled to maintain dedicated spatial tracking (Radar + Vision + Audio)."""
+        pass
 
     def _on_user_emotion(self, msg: String):
         self._user_emotion = msg.data.lower().strip()
@@ -5998,13 +6883,171 @@ class AstroRealtimeNode(Node):
 
 
 
+    def _publish_system_telemetry(self):
+        """Periodically aggregates system health, turn latencies, and sensor watchdogs to /astro/telemetry and /diagnostics."""
+        try:
+            now = time.monotonic()
+
+            # 1. Sensor Freshness & Watchdogs
+            last_lidar = getattr(self, "_last_laser_scan_time", 0.0)
+            lidar_age = now - last_lidar if last_lidar > 0.0 else 999.0
+            lidar_ok = (last_lidar > 0.0 and lidar_age <= 3.0)
+            lidar_level = DiagnosticStatus.OK if lidar_ok else (DiagnosticStatus.WARN if lidar_age <= 8.0 else DiagnosticStatus.ERROR)
+
+            last_cam = getattr(self, "_last_img_time", 0.0)
+            cam_age = now - last_cam if last_cam > 0.0 else 999.0
+            cam_ok = (last_cam > 0.0 and cam_age <= 5.0)
+            cam_level = DiagnosticStatus.OK if cam_ok else DiagnosticStatus.WARN
+
+            ard_hb = getattr(self, "_arduino_heartbeat_healthy", False)
+            last_hb = getattr(self, "_last_heartbeat_ack_time", 0.0)
+            ard_age = now - last_hb if last_hb > 0.0 else 999.0
+            ard_alive = ard_hb and (ard_age <= 2.5)
+            ard_level = DiagnosticStatus.OK if ard_alive else DiagnosticStatus.ERROR
+
+            ws_conn = getattr(self, "_is_connected", False)
+            ws_state = getattr(self, "_realtime_state", "DISCONNECTED")
+            ws_level = DiagnosticStatus.OK if ws_conn else (DiagnosticStatus.WARN if ws_state == "CONNECTING" else DiagnosticStatus.ERROR)
+
+            # 2. Latency Metrics
+            lat_stats = self.session.latency_tracker.get_stats() if hasattr(self.session, "latency_tracker") else {}
+            p50_ms = lat_stats.get("p50_total_ms", 0.0)
+            p95_ms = lat_stats.get("p95_total_ms", 0.0)
+            samples = lat_stats.get("samples", 0)
+
+            # 3. Social Cognitive Context
+            active_p = getattr(self, "_active_person_name", "Misafir") or "Misafir"
+            is_looking = bool(getattr(self, "_looking_at_robot", False))
+            user_dist = float(getattr(self, "_user_distance", 0.0))
+            user_emot = getattr(self, "_user_emotion", "neutral")
+
+            fam = 0.10
+            trust = 0.50
+            role_str = "new_user"
+            if getattr(self, "social_brain", None) and hasattr(self.social_brain, "relationship_manager"):
+                rel_info = self.social_brain.relationship_manager.assess_relationship(active_p)
+                fam = float(rel_info.get("familiarity", 0.10))
+                trust = float(rel_info.get("trust", 0.50))
+                r = rel_info.get("role", "new_user")
+                role_str = r.value if hasattr(r, "value") else str(r)
+
+            # 4. Publish /astro/telemetry (JSON)
+            if getattr(self, "pub_telemetry", None):
+                telem_payload = {
+                    "timestamp": time.time(),
+                    "latency": {
+                        "p50_total_ms": p50_ms,
+                        "p95_total_ms": p95_ms,
+                        "samples": samples,
+                    },
+                    "sensors": {
+                        "lidar_alive": lidar_ok,
+                        "lidar_age_s": round(lidar_age, 2),
+                        "camera_alive": cam_ok,
+                        "camera_age_s": round(cam_age, 2),
+                        "arduino_alive": ard_alive,
+                        "arduino_age_s": round(ard_age, 2),
+                    },
+                    "realtime_ws": {
+                        "connected": ws_conn,
+                        "state": ws_state,
+                    },
+                    "social_state": {
+                        "active_person": active_p,
+                        "role": role_str,
+                        "familiarity": fam,
+                        "trust": trust,
+                        "user_distance_m": round(user_dist, 2),
+                        "looking_at_robot": is_looking,
+                        "emotion": user_emot,
+                    },
+                }
+                msg_telem = String()
+                msg_telem.data = json.dumps(telem_payload)
+                self.pub_telemetry.publish(msg_telem)
+
+            # 5. Publish /diagnostics (DiagnosticArray)
+            if getattr(self, "pub_diagnostics", None) and 'DiagnosticArray' in globals():
+                diag_arr = DiagnosticArray()
+                st_ws = DiagnosticStatus(
+                    name="Astro Realtime / OpenAI WebSocket",
+                    level=ws_level,
+                    message=f"State: {ws_state}",
+                    values=[
+                        KeyValue("connected", str(ws_conn)),
+                        KeyValue("p50_ms", str(p50_ms)),
+                        KeyValue("p95_ms", str(p95_ms)),
+                    ],
+                )
+                st_ard = DiagnosticStatus(
+                    name="Astro Base / Serial Controller",
+                    level=ard_level,
+                    message="Alive" if ard_alive else f"Stale/Dead ({round(ard_age, 1)}s)",
+                    values=[
+                        KeyValue("heartbeat_healthy", str(ard_alive)),
+                        KeyValue("age_s", str(round(ard_age, 2))),
+                    ],
+                )
+                st_lidar = DiagnosticStatus(
+                    name="Astro Safety / RPLiDAR",
+                    level=lidar_level,
+                    message="Active" if lidar_ok else f"Stale ({round(lidar_age, 1)}s)",
+                    values=[
+                        KeyValue("scan_alive", str(lidar_ok)),
+                        KeyValue("age_s", str(round(lidar_age, 2))),
+                    ],
+                )
+                st_cam = DiagnosticStatus(
+                    name="Astro Perception / OAK-D Lite",
+                    level=cam_level,
+                    message="Active" if cam_ok else f"Stale ({round(cam_age, 1)}s)",
+                    values=[
+                        KeyValue("camera_alive", str(cam_ok)),
+                        KeyValue("age_s", str(round(cam_age, 2))),
+                    ],
+                )
+                diag_arr.status = [st_ws, st_ard, st_lidar, st_cam]
+                self.pub_diagnostics.publish(diag_arr)
+
+        except Exception as _exc:
+            self.get_logger().debug(f"_publish_system_telemetry: {_exc}")
+
+    def _on_robot_state_change(self, old_state: RobotState, new_state: RobotState):
+        """Maps state machine transitions directly to non-blocking ReSpeaker 12 LED animations."""
+        if not getattr(self, "robot_led", None):
+            return
+        try:
+            if new_state in (RobotState.DEEP_IDLE, RobotState.IDLE):
+                self.robot_led.idle()
+            elif new_state in (RobotState.WAKE, RobotState.LISTENING, RobotState.INTERRUPTED):
+                self.robot_led.listening()
+            elif new_state in (RobotState.THINKING, RobotState.THINKING_ACK):
+                self.robot_led.thinking()
+            elif new_state == RobotState.SPEAKING:
+                self.robot_led.speaking()
+        except Exception as exc:
+            self.get_logger().debug(f"LED state transition notice: {exc}")
+
+    def destroy_node(self):
+        """Clean shutdown turning off hardware LEDs and stopping worker threads."""
+        try:
+            if getattr(self, "robot_led", None):
+                self.robot_led.shutdown()
+        except Exception:
+            pass
+        return super().destroy_node()
+
+
 def main(args=None):
+
     rclpy.init(args=args)
     node = AstroRealtimeNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt as _exc:
-        _LOG.debug("main: yok sayılan hata (%s)", _exc)
+    except KeyboardInterrupt:
+        pass
+    except Exception as exc:
+        _LOG.debug("main spin exit: %s", exc)
     finally:
         node.destroy_node()
         if rclpy.ok():

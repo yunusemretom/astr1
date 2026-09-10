@@ -1,6 +1,8 @@
 """ASTRO V1 — Social Relationship and Familiarity Manager."""
 
-from typing import Any, Dict, Optional
+import json
+import time
+from typing import Any, Dict, List, Optional
 
 from astro_ai.contracts.intent_emotion_types import RelationshipRole
 from astro_ai.memory_v2.relationship_memory import RelationshipMemory
@@ -46,3 +48,51 @@ class RelationshipManager:
             "formality_level": formality_level,
             "shared_topics": prof["shared_topics"],
         }
+
+    def record_turn_interaction(
+        self,
+        person_name: str,
+        valence: float = 0.0,
+        topics: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Updates trust and familiarity scores based on conversational sentiment and turn count."""
+        prof = self.memory.get_or_create_profile(person_name)
+        new_count = prof["interaction_count"] + 1
+
+        # Familiarity increases asymptotically with each turn
+        new_fam = min(0.98, prof["familiarity"] + 0.03) if prof["name"].lower() != "baran" else 1.0
+
+        # Trust adjusts according to emotional valence / cooperative interaction
+        # Positive sentiment (valence > 0.2) builds trust; hostile sentiment degrades it
+        trust_delta = 0.02 if valence > 0.2 else (-0.03 if valence < -0.4 else 0.005)
+        new_trust = max(0.1, min(1.0, prof["trust"] + trust_delta)) if prof["name"].lower() != "baran" else 1.0
+
+        # Role progression
+        role = prof["role"]
+        if role == RelationshipRole.NEW_USER and new_count >= 3:
+            role = RelationshipRole.REGULAR_GUEST
+        if role == RelationshipRole.REGULAR_GUEST and new_count >= 8 and new_trust >= 0.60:
+            role = RelationshipRole.FRIEND
+
+        existing_topics = set(prof["shared_topics"])
+        if topics:
+            existing_topics.update(topics)
+
+        now = time.time()
+        self.memory.storage.execute_write(
+            """
+            UPDATE relationship_profiles
+            SET interaction_count = ?, familiarity = ?, trust = ?, role = ?, last_seen = ?, shared_topics_json = ?
+            WHERE person_id = ?
+            """,
+            (
+                new_count,
+                round(new_fam, 3),
+                round(new_trust, 3),
+                role.value,
+                now,
+                json.dumps(list(existing_topics)),
+                prof["person_id"],
+            ),
+        )
+        return self.assess_relationship(person_name)

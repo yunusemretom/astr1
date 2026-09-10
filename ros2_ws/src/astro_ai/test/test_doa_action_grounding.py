@@ -57,18 +57,21 @@ class TestSoundDirectionDOA(unittest.TestCase):
     """Tests for DOA geometric transformation and SoundDirection abstraction."""
 
     def test_circular_doa_to_yaw_conversion(self):
+        # Body yaw is REP-103: positive = LEFT (URDF head_yaw_joint axis 0 0 1, and
+        # GESTURE_PROFILES look_left=+35 / look_right=-35). ReSpeaker measures
+        # clockwise, so a bearing on the right becomes a negative yaw.
         # 0° (front) -> 0.0°
         self.assertAlmostEqual(circular_doa_to_yaw(0.0), 0.0)
-        # 35° (right) -> 35.0°
-        self.assertAlmostEqual(circular_doa_to_yaw(35.0), 35.0)
-        # 90° (right) -> 90.0°
-        self.assertAlmostEqual(circular_doa_to_yaw(90.0), 90.0)
+        # 35° (right) -> -35.0°
+        self.assertAlmostEqual(circular_doa_to_yaw(35.0), -35.0)
+        # 90° (right) -> -90.0°
+        self.assertAlmostEqual(circular_doa_to_yaw(90.0), -90.0)
         # 180° (back) -> 180.0°
-        self.assertAlmostEqual(circular_doa_to_yaw(180.0), 180.0)
-        # 270° (left) -> -90.0°
-        self.assertAlmostEqual(circular_doa_to_yaw(270.0), -90.0)
-        # 325° (left) -> -35.0°
-        self.assertAlmostEqual(circular_doa_to_yaw(325.0), -35.0)
+        self.assertAlmostEqual(abs(circular_doa_to_yaw(180.0)), 180.0)
+        # 270° (left) -> +90.0°
+        self.assertAlmostEqual(circular_doa_to_yaw(270.0), 90.0)
+        # 325° (left) -> +35.0°
+        self.assertAlmostEqual(circular_doa_to_yaw(325.0), 35.0)
 
     def test_test_a_turn_to_sound_no_direction_when_doa_unavailable(self):
         """Test A: User says 'Sesimin geldiği yöne dön'. DOA is unavailable -> NO_DIRECTION, no motor move."""
@@ -86,7 +89,7 @@ class TestSoundDirectionDOA(unittest.TestCase):
         self.assertIn("tespit edilemedi", res.message)
 
     def test_test_b_turn_to_sound_success_with_valid_right_doa(self):
-        """Test B: DOA has azimuth = +35°, confidence = 0.91 -> turn +35° executed with ACK."""
+        """Test B: DOA bearing 35° (right) -> turn -35° (right in REP-103) executed with ACK."""
         mock_node = MockNode()
         action_mgr = ActionManager(node=mock_node)
 
@@ -102,18 +105,18 @@ class TestSoundDirectionDOA(unittest.TestCase):
 
         self.assertTrue(res.success)
         self.assertEqual(res.action, "turn_to_sound")
-        self.assertAlmostEqual(res.azimuth_deg, 35.0, places=1)
+        self.assertAlmostEqual(res.azimuth_deg, -35.0, places=1)
         self.assertGreaterEqual(res.confidence, 0.40)
         self.assertTrue(res.hardware_ack)
         self.assertGreater(len(mock_node.published_twists) + len(mock_node.published_head_cmds), 0)
 
     def test_controlled_left_sound_direction_execution(self):
-        """Controlled Left (-45° / raw 315°) sound -> produces negative azimuth (-45°) and executes Left turn."""
+        """Controlled Left (raw 315°) sound -> produces positive azimuth (+45°) and executes Left turn."""
         mock_node = MockNode()
         action_mgr = ActionManager(node=mock_node)
 
         action_mgr.update_audio_state(
-            raw_doa_deg=315.0,  # 315° = -45° (Left)
+            raw_doa_deg=315.0,  # bearing 315° = 45° to the left -> +45° body yaw
             rms_level=2200.0,
             vad_active=True,
             is_speaking=False,
@@ -123,7 +126,7 @@ class TestSoundDirectionDOA(unittest.TestCase):
 
         self.assertTrue(res.success)
         self.assertEqual(res.action, "turn_to_sound")
-        self.assertAlmostEqual(res.azimuth_deg, -45.0, places=1)
+        self.assertAlmostEqual(res.azimuth_deg, 45.0, places=1)
         self.assertTrue(res.hardware_ack)
 
     def test_zero_degree_uncalibrated_idle_rejected(self):

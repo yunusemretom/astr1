@@ -1,104 +1,321 @@
-# MotorTest — sol / sağ / kafa motor test sketch'i
+// ============================================================
+// ASTRO V1 - PRODUCTION ARDUINO FIRMWARE (Mega 2560)
+// BTS7960 Motor Sürücülü Kafa & Tekerlek Kontrolü
+// Baud Rate: 500000 | Non-Blocking ROS2 & ASCII Dual Driver
+// ============================================================
 
-Tek amacı var: **motorlar dönüyor mu, doğru yöne mi dönüyor, enkoderler sayıyor mu?**
-PID, IMU, TMC2209 ve ROS protokolü yoktur. Ana firmware'i yüklemeden önce
-kablolamayı doğrulamak için kullanın.
+#include <Arduino.h>
 
-- Kart: **Arduino Mega 2560**
-- Serial Monitor: **115200 baud**, satır sonu **Newline**
-- Ek kütüphane gerekmez (sadece Arduino core)
+// =======================
+// BTS7960 MOTOR PINLERI
+// =======================
+#define L_MOTOR_PWM_FWD    5   // Sol Teker İleri (RPWM)
+#define L_MOTOR_PWM_REV    6   // Sol Teker Geri  (LPWM)
 
-## Pin haritası (`pins.h`)
+#define R_MOTOR_PWM_FWD    9   // Sağ Teker İleri (RPWM)
+#define R_MOTOR_PWM_REV   10   // Sağ Teker Geri  (LPWM)
 
-| İşlev | Pin | Timer |
-|---|---|---|
-| Sol motor RPWM / LPWM | **5 / 6** | Timer3A / Timer4A |
-| Sağ motor RPWM / LPWM | **9 / 10** | Timer2B / Timer2A |
-| Kafa motoru RPWM / LPWM | **44 / 45** | Timer5C / Timer5B |
-| Sol enkoder A / B | 2 (INT0) / 3 (INT1) | — |
-| Sağ enkoder A / B | 18 (INT5) / 19 (INT4) | — |
-| Kafa enkoder A / B | 20 (INT3) / 21 (INT2) | — |
+#define HEAD_MOTOR_PWM_FWD 44  // Kafa Sağa (RPWM)
+#define HEAD_MOTOR_PWM_REV 45  // Kafa Sola (LPWM)
 
-> Pin haritası `arduino/astro_firmware/include/pins.h` ile birebir aynıdır —
-> ikisi birlikte güncellenmelidir.
+#define STATUS_LED         13
 
-> ⚠️ Mega'nın 6 dış kesme pininin **tamamı** (2, 3, 18, 19, 20, 21) enkoderlere
-> ayrıldı. Bunun iki sonucu var: 20/21 = I2C olduğu için **MPU-6050 IMU**, 18/19 =
-> Serial1 olduğu için **TMC2209** kullanılamaz. Ana firmware'den ikisi de
-> kaldırıldı.
+// =======================
+// ENKODER PINLERI (Opsiyonel)
+// =======================
+#define L_ENC_A     2
+#define L_ENC_B     3
+#define R_ENC_A    18
+#define R_ENC_B    19
+#define HEAD_ENC_A 20
+#define HEAD_ENC_B 21
 
-BTS7960'ların `R_EN`/`L_EN` uçları 5V'a sabitlenmiş: sürücüler her zaman aktif,
-MCU tarafından donanımsal olarak kesilemiyor. Durdurma yalnızca PWM = 0 ile.
+// =======================
+// AYARLAR VE HIZ TAVANLARI
+// =======================
+static const uint32_t SERIAL_BAUD = 500000;
+static const int      HEAD_PWM    = 70;    // Kafa dönüş PWM gücü (yumuşak ve sessiz)
+static const int      WHEEL_PWM   = 120;   // Tekerlek PWM gücü
+static const uint32_t WATCHDOG_TIMEOUT_MS = 1500; // 1.5 sn komut gelmezse dur
 
-## Komutlar
+// =======================
+// PROTOKOL SABITLERI
+// =======================
+static const uint8_t SOF1 = 0xAA;
+static const uint8_t SOF2 = 0x55;
 
-| Komut | Etki |
-|---|---|
-| `h` | yardım menüsü |
-| `t` | **tekerlek otomatik testi**: ileri → dur → geri → dur → sağa → dur → sola → dur (her adım 2 sn) |
-| `y` | **kafa otomatik testi**: kısa sağa, kısa sola (400 ms, PWM 80) — kabaca başladığı yere döner |
-| `l <pwm>` | sol tekerlek (`-255..255`), örn. `l 120` / `l -120` |
-| `r <pwm>` | sağ tekerlek |
-| `b <pwm>` | iki tekerlek birden |
-| `k <pwm>` | kafa motoru — tavan `HEAD_PWM_LIMIT` (100), aşan değer kırpılır |
-| `c <derece>` | kafa tick/derece kalibrasyonu |
-| `s` | DUR |
-| `e` | enkoder sayaçlarını sıfırla |
-| `m` | anlık durumu bir kez yazdır |
+enum MsgId : uint8_t {
+  HEARTBEAT       = 0x01,
+  WHEEL_CMD       = 0x02,
+  HEAD_CMD        = 0x03,
+  HEARTBEAT_ACK   = 0x81,
+  ENCODER_TICKS   = 0x82
+};
 
-## Çıktı
+// =======================
+// GLOBAL DEGISKENLER
+// =======================
+volatile int32_t g_head_ticks = 0;
+volatile int32_t g_left_ticks = 0;
+volatile int32_t g_right_ticks = 0;
 
-Her 250 ms'de bir satır:
+static uint32_t g_last_cmd_ms = 0;
+static bool     g_head_active = false;
 
-```
-PWM L=150 R=150 K=0 | TICK L=4820 R=4791 K=0 | HIZ L=1930 R=1918 K=0 tick/s
-```
+// =======================
+// ENKODER KESMELERI
+// =======================
+void headEncISR()  { g_head_ticks  += digitalRead(HEAD_ENC_B) ? -1 : +1; }
+void leftEncISR()  { g_left_ticks  += digitalRead(L_ENC_B)    ? -1 : +1; }
+void rightEncISR() { g_right_ticks += digitalRead(R_ENC_B)    ? -1 : +1; }
 
-Sorun varsa satır sonuna teşhis eklenir:
+// =======================
+// MOTOR SURUS FONKSIYONLARI
+// =======================
+void setMotorPWM(int fwd_pin, int rev_pin, int val) {
+  val = constrain(val, -255, 255);
+  if (val > 0) {
+    analogWrite(rev_pin, 0);
+    analogWrite(fwd_pin, val);
+  } else if (val < 0) {
+    analogWrite(fwd_pin, 0);
+    analogWrite(rev_pin, -val);
+  } else {
+    analogWrite(fwd_pin, 0);
+    analogWrite(rev_pin, 0);
+  }
+}
 
-- `[!] SOL donmuyor/enkoder yok` — PWM veriliyor ama tick artmıyor
-  (motor gerçekten dönmüyorsa güç/sürücü sorunu; dönüyorsa enkoder kablosu)
-- `[!] SAG ters yonde` — motor ileri komutunda geri sayıyor
-  (motor uçlarını veya enkoder A/B'yi ters bağlamışsınız)
-- `[STALL] Kafa donmuyor -> motor kesildi` — kafaya PWM veriliyor ama 300 ms
-  boyunca tick değişmedi; mekanik dayanağa dayanmış olabilir
+void setHeadPWM(int pwm) {
+  setMotorPWM(HEAD_MOTOR_PWM_FWD, HEAD_MOTOR_PWM_REV, pwm);
+  g_head_active = (pwm != 0);
+  g_last_cmd_ms = millis();
+}
 
-İki tekerin `tick/s` değerleri aynı PWM'de kabaca eşit olmalı; ciddi fark varsa
-mekanik sürtünme ya da sürücü dengesizliği vardır.
+void setWheelsPWM(int left_pwm, int right_pwm) {
+  setMotorPWM(L_MOTOR_PWM_FWD, L_MOTOR_PWM_REV, left_pwm);
+  setMotorPWM(R_MOTOR_PWM_FWD, R_MOTOR_PWM_REV, right_pwm);
+  g_last_cmd_ms = millis();
+}
 
-## Kafa tick/derece kalibrasyonu
+void stopAllMotors() {
+  analogWrite(L_MOTOR_PWM_FWD, 0);
+  analogWrite(L_MOTOR_PWM_REV, 0);
+  analogWrite(R_MOTOR_PWM_FWD, 0);
+  analogWrite(R_MOTOR_PWM_REV, 0);
+  analogWrite(HEAD_MOTOR_PWM_FWD, 0);
+  analogWrite(HEAD_MOTOR_PWM_REV, 0);
+  g_head_active = false;
+}
 
-Motorun ürün sayfası enkoder CPR'ını vermiyor, bu yüzden ölçmek gerekiyor:
+// =======================
+// CRC8 HESABI
+// =======================
+uint8_t crc8(const uint8_t* data, size_t len) {
+  uint8_t crc = 0x00;
+  for (size_t i = 0; i < len; ++i) {
+    crc ^= data[i];
+    for (uint8_t j = 0; j < 8; ++j) {
+      if (crc & 0x80) crc = (crc << 1) ^ 0x07;
+      else            crc <<= 1;
+    }
+  }
+  return crc;
+}
 
-1. `e` → sayaçları sıfırla
-2. Kafayı bilinen bir açıya çevir — elle, ya da `k 60` verip `s` ile durdurup
-   açıyı iletki ile ölç
-3. `c 90` (çevirdiğiniz gerçek açıyı yazın)
+void sendPacket(uint8_t msg_id, const uint8_t* payload, uint8_t len) {
+  uint8_t length = 1 + len;
+  uint8_t header[4] = { SOF1, SOF2, length, msg_id };
+  Serial.write(header, 4);
+  if (len > 0 && payload != nullptr) {
+    Serial.write(payload, len);
+  }
+  uint8_t body[256];
+  body[0] = length;
+  body[1] = msg_id;
+  if (len > 0 && payload != nullptr) {
+    memcpy(&body[2], payload, len);
+  }
+  uint8_t c = crc8(body, 2 + len);
+  Serial.write(c);
+}
 
-Çıktı:
+// =======================
+// BINARY PAKET ISLEYICI
+// =======================
+void handleBinaryPacket(uint8_t msg_id, const uint8_t* pl, uint8_t len) {
+  g_last_cmd_ms = millis();
+  
+  switch (msg_id) {
+    case HEARTBEAT: {
+      sendPacket(HEARTBEAT_ACK, pl, len);
+      digitalWrite(STATUS_LED, !digitalRead(STATUS_LED));
+    } break;
 
-```
-[KALIBRASYON] tick=1320  aci=90 derece  ->  tick/derece = 14.667
-  360 derece = 5280.0 tick
-```
+    case HEAD_CMD: {
+      if (len >= 4) {
+        float angle_deg;
+        memcpy(&angle_deg, pl, 4);
+        if (angle_deg > 5.0f) {
+          setHeadPWM(HEAD_PWM);     // Sağa dön
+        } else if (angle_deg < -5.0f) {
+          setHeadPWM(-HEAD_PWM);    // Sola dön
+        } else {
+          setHeadPWM(0);            // Hedefte dur
+        }
+      }
+    } break;
 
-Bu değeri firmware'e kafa konum PID'i yazılırken `HEAD_TICKS_PER_DEG` sabiti
-olarak gireceğiz.
+    case WHEEL_CMD: {
+      if (len >= 8) {
+        float left_rpm, right_rpm;
+        memcpy(&left_rpm, &pl[0], 4);
+        memcpy(&right_rpm, &pl[4], 4);
+        int l_pwm = constrain((int)(left_rpm * 2.5f), -255, 255);
+        int r_pwm = constrain((int)(right_rpm * 2.5f), -255, 255);
+        setWheelsPWM(l_pwm, r_pwm);
+      }
+    } break;
+  }
+}
 
-## Güvenlik
+// =======================
+// ASCII KOMUT ISLEYICI
+// =======================
+void handleAsciiCommand(char c) {
+  g_last_cmd_ms = millis();
 
-- Tekerlekleri **havada** (sehpa üstünde) test edin.
-- Kafa 1000 rpm'lik bir motor — tam PWM'de savrulur. Bu yüzden kafa PWM'i
-  `HEAD_PWM_LIMIT = 100` ile sınırlı ve otomatik testi çok kısa tutuldu.
-- Kafada limit switch yok. Dayanağa dayanırsa stall koruması motoru keser.
-- Elle verilen PWM komutları 10 sn sonra otomatik kesilir (`IDLE_TIMEOUT_MS`).
-- `s` her an tüm motorları durdurur, otomatik testleri de iptal eder.
+  switch (c) {
+    // Kafa Kontrolleri
+    case '5': // Kafa Sağa Dön
+      setHeadPWM(HEAD_PWM);
+      break;
 
-## PWM frekansı
+    case '6': // Kafa Sola Dön
+      setHeadPWM(-HEAD_PWM);
+      break;
 
-`PWM_HIGH_FREQ 1` iken Timer2/3/4/5 prescaler'ı 1'e çekilir → **31.37 kHz**
-(sessiz). `millis()`/`micros()` Timer0'da olduğu için etkilenmez.
+    case '0': // Tüm Motorları Durdur
+      stopAllMotors();
+      break;
 
-BTS7960 datasheet'i ~25 kHz'e kadar veriyor; 31 kHz pratikte yaygın kullanılıyor
-ama spec'in bir tık üstünde. Sürücüler ısınırsa `PWM_HIGH_FREQ 0` yapın —
-o zaman 490 Hz'e döner (motorlar duyulur şekilde vınlar).
+    // Tekerlek Testleri
+    case '1': case 'w': case 'W': // İleri
+      setWheelsPWM(WHEEL_PWM, WHEEL_PWM);
+      break;
+
+    case '2': case 's': case 'S': // Geri
+      setWheelsPWM(-WHEEL_PWM, -WHEEL_PWM);
+      break;
+
+    case '3': case 'd': case 'D': // Sağa Dön
+      setWheelsPWM(WHEEL_PWM, -WHEEL_PWM);
+      break;
+
+    case '4': case 'a': case 'A': // Sola Dön
+      setWheelsPWM(-WHEEL_PWM, WHEEL_PWM);
+      break;
+
+    default:
+      break;
+  }
+}
+
+// =======================
+// SERI PROTOKOL AYRISTIRICI (State Machine)
+// =======================
+void parseSerialStream() {
+  static uint8_t state = 0;
+  static uint8_t expected_len = 0;
+  static uint8_t msg_id = 0;
+  static uint8_t payload[64];
+  static uint8_t rx_count = 0;
+
+  while (Serial.available() > 0) {
+    uint8_t b = Serial.read();
+
+    // 1. Binary Paket Yakalama
+    if (state == 0) {
+      if (b == SOF1) {
+        state = 1;
+      } else {
+        // Doğrudan ASCII Karakter
+        if (b != '\r' && b != '\n') {
+          handleAsciiCommand((char)b);
+        }
+      }
+    } else if (state == 1) {
+      if (b == SOF2) {
+        state = 2;
+      } else if (b == SOF1) {
+        state = 1;
+      } else {
+        handleAsciiCommand((char)b);
+        state = 0;
+      }
+    } else if (state == 2) {
+      expected_len = b;
+      rx_count = 0;
+      state = 3;
+    } else if (state == 3) {
+      if (rx_count == 0) {
+        msg_id = b;
+      } else if (rx_count - 1 < sizeof(payload)) {
+        payload[rx_count - 1] = b;
+      }
+      rx_count++;
+      if (rx_count >= expected_len) {
+        state = 4;
+      }
+    } else if (state == 4) {
+      uint8_t body[64];
+      body[0] = expected_len;
+      body[1] = msg_id;
+      if (expected_len > 1) {
+        memcpy(&body[2], payload, expected_len - 1);
+      }
+      uint8_t expected_crc = crc8(body, expected_len + 1);
+      if (b == expected_crc) {
+        handleBinaryPacket(msg_id, payload, expected_len - 1);
+      }
+      state = 0;
+    }
+  }
+}
+
+// =======================
+// SETUP
+// =======================
+void setup() {
+  Serial.begin(SERIAL_BAUD);
+
+  pinMode(L_MOTOR_PWM_FWD, OUTPUT);
+  pinMode(L_MOTOR_PWM_REV, OUTPUT);
+  pinMode(R_MOTOR_PWM_FWD, OUTPUT);
+  pinMode(R_MOTOR_PWM_REV, OUTPUT);
+  pinMode(HEAD_MOTOR_PWM_FWD, OUTPUT);
+  pinMode(HEAD_MOTOR_PWM_REV, OUTPUT);
+  pinMode(STATUS_LED, OUTPUT);
+
+  // Enkoder pinleri
+  pinMode(HEAD_ENC_A, INPUT_PULLUP);
+  pinMode(HEAD_ENC_B, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(HEAD_ENC_A), headEncISR, RISING);
+
+  stopAllMotors();
+  g_last_cmd_ms = millis();
+}
+
+// =======================
+// MAIN LOOP
+// =======================
+void loop() {
+  parseSerialStream();
+
+  // Güvenlik: 1.5 saniye boyunca komut gelmezse motorları durdur
+  if (millis() - g_last_cmd_ms > WATCHDOG_TIMEOUT_MS) {
+    if (g_head_active) {
+      stopAllMotors();
+    }
+  }
+}

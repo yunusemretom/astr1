@@ -96,17 +96,36 @@ class ConsolidationEngine:
         t_low = text.lower()
 
         # Turkish preference patterns
-        # "benim tuttuğum takım X", "en sevdiğim takım X", "X tutuyorum"
+        # 1. Favorite Team
         m_team = re.search(r"(?:tuttuğum takım|tuttugum takim|en sevdiğim takım|en sevdigim takim)\s+([a-zA-ZçğıöşüÇĞİÖŞÜ\s]+)", t_low)
         if m_team:
             results.append((person_name, "favorite_team", m_team.group(1).strip()))
 
+        # 2. Favorite Food
         m_food = re.search(r"(?:en sevdiğim yemek|en sevdigim yemek|favori yemeğim)\s+([a-zA-ZçğıöşüÇĞİÖŞÜ\s]+)", t_low)
         if m_food:
             results.append((person_name, "favorite_food", m_food.group(1).strip()))
 
+        # 3. Hometown / Living City
         m_city = re.search(r"(?:memleketim|yaşadığım şehir|yasadigim sehir)\s+([a-zA-ZçğıöşüÇĞİÖŞÜ\s]+)", t_low)
         if m_city:
             results.append((person_name, "hometown", m_city.group(1).strip()))
+
+        # 4. Profession / Role
+        m_prof = re.search(r"([a-zA-ZçğıöşüÇĞİÖŞÜ]+)\s+(?:mühendisiyim|muhendisiyim|doktoruyum|öğretmeniyim|ogretmeniyim|öğrencisiyim|ogrencisiyim)", t_low)
+        if m_prof:
+            results.append((person_name, "profession", f"{m_prof.group(1).strip()} mühendisi" if "mühendis" in m_prof.group(0) else m_prof.group(1).strip()))
+        else:
+            m_meslek = re.search(r"(?:mesleğim|meslegim)\s+([a-zA-ZçğıöşüÇĞİÖŞÜ\s]+)", t_low)
+            if m_meslek:
+                results.append((person_name, "profession", m_meslek.group(1).strip()))
+
+        # 5. Likes / Interest
+        m_like = re.search(r"([a-zA-ZçğıöşüÇĞİÖŞÜ0-9\s]+?)\s+(?:seviyorum|beğeniyorum|begeniyorum|tutkunuyum)", t_low)
+        if m_like:
+            candidate = m_like.group(1).strip()
+            candidate = re.sub(r"\b(?:çok|cok|fazla|gerçekten|gercekten)\b", "", candidate).strip()
+            if candidate and len(candidate) > 2:
+                results.append((person_name, "likes", candidate))
 
         return results

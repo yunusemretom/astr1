@@ -73,6 +73,8 @@ class VoiceRecognizer:
         self._lock = threading.RLock()
         self._known_voiceprints: Dict[str, List[np.ndarray]] = {}
         self._speaker_metadata: Dict[str, Dict[str, Any]] = {}
+        self._playback_ref_bytes: bytes = b""
+        self._playback_ref_lock = threading.Lock()
 
         self._init_default_speakers()
         self.reload_voiceprints()
@@ -289,6 +291,65 @@ class VoiceRecognizer:
         """Convenience method returning (name, score) for direct pipeline consumption."""
         name, score, _ = self.recognize_voice(audio_arr, sample_rate)
         return name, score
+
+    def update_playback_reference(self, pcm_bytes: bytes, max_history_bytes: int = 48000):
+        """Updates reference PCM ring buffer from recent robot TTS/playback audio (16kHz int16)."""
+        if not pcm_bytes:
+            return
+        with self._playback_ref_lock:
+            self._playback_ref_bytes = (self._playback_ref_bytes + pcm_bytes)[-max_history_bytes:]
+
+    def clear_playback_reference(self):
+        """Clears playback reference buffer when playback stops or turn finishes."""
+        with self._playback_ref_lock:
+            self._playback_ref_bytes = b""
+
+    def score_self_voice(self, audio_data: Any, reference_pcm: Optional[bytes] = None, max_lag_samples: int = 4800) -> float:
+        """Calculates acoustic self-voice / playback echo score (0.0 to 1.0) using normalized cross-correlation.
+
+        Returns >= 0.70 when audio matches robot playback echo, and < 0.40 for human speech.
+        """
+        if audio_data is None:
+            return 0.0
+        if isinstance(audio_data, (bytes, bytearray)):
+            mic_bytes = bytes(audio_data)
+        elif isinstance(audio_data, np.ndarray):
+            mic_bytes = audio_data.astype(np.int16).tobytes()
+        else:
+            return 0.0
+
+        if reference_pcm is not None:
+            ref_bytes = reference_pcm
+        else:
+            with self._playback_ref_lock:
+                ref_bytes = self._playback_ref_bytes
+
+        if not mic_bytes or not ref_bytes:
+            return 0.0
+
+        mic = np.frombuffer(mic_bytes, dtype=np.int16).astype(np.float32)
+        ref = np.frombuffer(ref_bytes, dtype=np.int16).astype(np.float32)
+
+        if len(mic) == 0 or len(ref) == 0:
+            return 0.0
+
+        mic_centered = mic - np.mean(mic)
+        mic_norm = float(np.linalg.norm(mic_centered))
+        if mic_norm < 1e-4:
+            return 0.0
+
+        ref_window = ref[-max_lag_samples:] if len(ref) > max_lag_samples else ref
+        if len(ref_window) < len(mic):
+            return 0.0
+
+        ref_centered = ref_window - np.mean(ref_window)
+        corr = np.correlate(ref_centered, mic_centered, mode='valid')
+        ref_sq = ref_centered ** 2
+        window_energy = np.correlate(ref_sq, np.ones(len(mic), dtype=np.float32), mode='valid')
+        denom = mic_norm * np.sqrt(np.maximum(window_energy, 1e-6))
+        norm_corr = corr / denom
+        max_corr = float(np.max(norm_corr)) if len(norm_corr) > 0 else 0.0
+        return round(max(0.0, min(1.0, max_corr)), 4)
 
     def get_telemetry(self) -> Dict[str, Any]:
         """Returns runtime speaker recognition telemetry."""

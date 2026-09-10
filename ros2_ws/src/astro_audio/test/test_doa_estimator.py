@@ -47,12 +47,110 @@ def generate_multichannel_synthetic_sound(
     np.random.seed(seed)
     base_signal = np.random.normal(0, 1, n_samples * 2)
     channels = np.zeros((4, n_samples), dtype=np.float32)
+
+    # Gecikme ILERI degil GERI kaydirir. `delays` normalize edildikten sonra
+    # kaynaga en uzak mikrofonun degeri en buyuktur, ve o mikrofon sesi en GEC
+    # duymalidir; base dizisinden daha ERKEN bir indeksten ornekleyerek olur.
+    #
+    # Bu satir uzun sure `+ shift_samples` idi, yani uzak mikrofon once duyuyordu.
+    # Kestiricideki 180 derecelik isaret hatasiyla birlikte iki yanlis birbirini
+    # goturuyor ve asagidaki testlerin hepsi geciyordu; sahne, olcmesi gereken
+    # hatayi uretiyordu. Ikisi ayni anda duzeltildi.
+    origin = n_samples // 2
     for i in range(4):
         shift_samples = delays[i] * sample_rate
-        idx = np.arange(n_samples) + shift_samples
+        idx = np.arange(n_samples) + origin - shift_samples
         channels[i] = np.interp(idx, np.arange(len(base_signal)), base_signal) * 10000.0
-        
+
     return channels
+
+
+def shifted_channels(right_lead_samples: int, front_lead_samples: int = 0,
+                     length: int = 2048, seed: int = 3) -> np.ndarray:
+    """Dort kanal, tamsayi ornek kaydirmasiyla ve acikca yazilmis fizikle.
+
+    Yukaridaki `generate_multichannel_synthetic_sound` uretecine kasten
+    guvenilmiyor. O uretec gecikmeyi `np.interp(arange(n) + shift, ...)` ile
+    uyguluyor: ileri indeksten ornekleme sinyali ONE alir, yani "gecikme" dedigi
+    sey aslinda erkenlik. Kestiricideki isaret hatasiyla birlikte iki yanlis
+    birbirini goturdugu icin o testler gecti ve hata yillarca gorunmedi.
+
+    Burada tek bir kural var ve tartismaya kapali: bir kaynaga daha yakin olan
+    mikrofon sesi daha ERKEN duyar. Erkenlik, base dizisinden daha ILERI bir
+    indeksten baslamak demektir.
+
+        right_lead_samples > 0  -> kaynak sagda (sag mikrofon once duyar)
+        front_lead_samples > 0  -> kaynak onde  (on mikrofon once duyar)
+
+    Kanal sirasi kestiricinin sozlesmesi: 0 on, 1 sag, 2 arka, 3 sol.
+    """
+    rng = np.random.default_rng(seed)
+    base = rng.normal(0, 1, length * 3) * 5000.0
+    origin = length
+
+    def take(lead: int) -> np.ndarray:
+        return base[origin + lead: origin + lead + length]
+
+    return np.stack([
+        take(+front_lead_samples),   # 0 on
+        take(+right_lead_samples),   # 1 sag
+        take(-front_lead_samples),   # 2 arka
+        take(-right_lead_samples),   # 3 sol
+    ])
+
+
+class TestTheAngleIsNotMirrored(unittest.TestCase):
+    """Sagdan gelen ses saga, soldan gelen sola raporlanmali.
+
+    Bu, sahadaki 130 saniyelik kosuda kafanin konusanin TERSINE donmesinin
+    kaynagi. `gcc_phat`'in docstring'i "tau: positive if refsig lags sig" diyor,
+    ama uygulamasi bunun tam tersini donduruyor -- olculdu: refsig sig'den 3
+    ornek geride oldugunda tau -3.00 cikiyor. Asagidaki `delta_x = -tau * c`
+    satirlari ise *docstring'e* gore yazilmis. Sonuc 180 derecelik sabit hata.
+
+    Donanim gerekmiyor: bunlarin hicbiri ReSpeaker'in kanal sirasina bagli degil,
+    yalnizca hangi mikrofonun once duydugunu bilmeye bagli.
+    """
+
+    def setUp(self):
+        self.estimator = AcousticDOAEstimator(sample_rate=16000)
+
+    def test_sag_mikrofon_once_duyunca_azimut_pozitif(self):
+        azimuth, _conf, valid = self.estimator.estimate_from_multichannel_pcm(
+            shifted_channels(right_lead_samples=4))
+
+        self.assertTrue(valid)
+        self.assertAlmostEqual(azimuth, 90.0, delta=10.0,
+                               msg="sagdan gelen ses sol olarak raporlandi")
+
+    def test_sol_mikrofon_once_duyunca_azimut_negatif(self):
+        azimuth, _conf, valid = self.estimator.estimate_from_multichannel_pcm(
+            shifted_channels(right_lead_samples=-4))
+
+        self.assertTrue(valid)
+        self.assertAlmostEqual(azimuth, -90.0, delta=10.0,
+                               msg="soldan gelen ses sag olarak raporlandi")
+
+    def test_on_mikrofon_once_duyunca_azimut_sifira_yakin(self):
+        azimuth, _conf, valid = self.estimator.estimate_from_multichannel_pcm(
+            shifted_channels(right_lead_samples=0, front_lead_samples=4))
+
+        self.assertTrue(valid)
+        self.assertAlmostEqual(azimuth, 0.0, delta=10.0,
+                               msg="onden gelen ses arkadan geliyor olarak raporlandi")
+
+    def test_gcc_phat_docstringinde_yazan_isareti_dondurur(self):
+        """refsig, sig'den geride ise tau pozitif olmali -- fonksiyonun kendi sozu."""
+        rng = np.random.default_rng(0)
+        base = rng.normal(0, 1, 4096)
+        sig = base[100:1100]
+        refsig = base[97:1097]      # refsig, sig'den 3 ornek GERIDE
+
+        tau, _quality = gcc_phat(sig, refsig, fs=16000,
+                                 max_tau=ReSpeakerGeometry.PAIR_DIST_M / 343.0)
+
+        self.assertAlmostEqual(tau * 16000, 3.0, delta=0.5,
+                               msg="gcc_phat docstring'inin tersi isareti donduruyor")
 
 
 class TestAcousticDOAEstimator(unittest.TestCase):

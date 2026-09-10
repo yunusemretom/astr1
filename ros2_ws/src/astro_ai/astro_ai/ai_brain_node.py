@@ -1692,7 +1692,7 @@ class AiBrainNode(Node):
         gemini_text_models = [
             m.strip() for m in os.getenv(
                 "GEMINI_TEXT_MODELS",
-                "gemini-2.0-flash,gemini-1.5-flash,gemini-2.5-flash",
+                "gemini-2.0-flash,gemini-1.5-flash,gemini-1.5-pro",
             ).split(",") if m.strip()
         ]
         for g_model in gemini_text_models:

@@ -31,7 +31,16 @@ endif()
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/WheelCmd.msg"
   "msg/HeadCmd.msg"
+  "msg/HeadState.msg"
+  "msg/GazeStatus.msg"
   DEPENDENCIES std_msgs
+)
+
+
+# Install Python modules
+install(DIRECTORY
+  astro_base
+  DESTINATION "${PYTHON_INSTALL_DIR}"
 )
 
 # Install Python executables - Çalıştırılabilir scriptimizi hedefe kopyalıyoruz
@@ -42,9 +51,34 @@ install(PROGRAMS
 )
 
 install(PROGRAMS
+  astro_base/social_gaze_node.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME social_gaze
+)
+
+install(PROGRAMS
   astro_base/head_tracker_node.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME head_tracker
+)
+
+install(PROGRAMS
+  astro_base/standalone_gaze_node.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME standalone_gaze
+)
+
+install(PROGRAMS
+  astro_base/standalone_gaze_ros_node.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME standalone_gaze_ros
+)
+
+# Install launch and config directories
+install(DIRECTORY
+  launch
+  config
+  DESTINATION share/${PROJECT_NAME}
 )
 
 # Linting
@@ -54,3 +88,5 @@ if(BUILD_TESTING)
 endif()
 
 ament_package()
+
+
