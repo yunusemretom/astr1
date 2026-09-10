@@ -5,6 +5,13 @@ and holds a spoken Turkish conversation. Every AI engine it depends on has a
 working fallback, so a missing API key or a dead network degrades the robot
 instead of stopping it.
 
+> **This is a fork, and ASTRO is not my project.** It is developed by
+> [BarlineTR](https://github.com/BarlineTR/astr1), who wrote the large majority
+> of it. I am a contributor with roughly 100 commits. My work is concentrated in
+> specific subsystems, listed under [My contributions](#-my-contributions)
+> below. Everything else in this README documents the project as a whole, not
+> my authorship of it.
+
 ![demo](docs/demo.gif)
 
 ## Tech stack
@@ -663,9 +670,9 @@ setting you believe you changed.
 - Local XTTS on CPU is slower than real time. It needs a GPU to be usable.
 - The conversation state machine is rule-based, so it handles interruptions and
   topic changes poorly.
-- **Repository history.** This repo was started from a fork, so its commit
-  history contains a large amount of unrelated upstream work. All current source
-  is this project's own.
+- **Repository history.** The project's history descends from `ros2/rosidl`, so
+  the commit log contains several hundred unrelated upstream ROS commits
+  alongside the ASTRO work.
 
 ## 🗺️ Roadmap
 
@@ -673,4 +680,37 @@ setting you believe you changed.
 - Speaker diarization so multi-person conversation is tracked properly.
 - Move the conversation manager off hand-written rules.
 - Onboard deployment on Jetson with measured end-to-end latency.
-- Relocate to a clean repository so the history reflects the actual work.
+- Continue upstream in [BarlineTR/astr1](https://github.com/BarlineTR/astr1),
+  which is where development happens.
+
+---
+
+## 👤 My contributions
+
+For anyone evaluating my work specifically, these are the parts of ASTRO I
+wrote. Everything else is the upstream author's.
+
+**Test suite.** Essentially all of it, across four packages: detection quality
+and backend tests for vision, detection-hold behaviour, image payload handling,
+speech detection, ReSpeaker idle sector logic, the direction-of-arrival yaw
+convention, session recording, and the `conftest.py` fixtures the rest depend
+on. The project had no automated tests before this.
+
+**Navigation and simulation.** The `astro_navigation` package: `nav2_params.yaml`
+(the largest single file I own here), the SLAM Toolbox configuration and both
+launch files. Plus the `astro_sim` Gazebo launch and its EKF configuration, which
+is what makes it possible to work on navigation without the physical robot.
+
+**Audio.** The OpenAI TTS engine and the speaker-recognition database, plus the
+ReSpeaker USB capture layer and its sector mapping. I also introduced the local
+XTTS integration (`xtts_client.py`, `xtts_worker.py`), though those two files
+have since been substantially rewritten upstream and are now mostly not mine.
+
+**Firmware and tooling.** The Arduino base firmware for the motor and encoder
+layer, `MotorTest` almost entirely and `AstroFirmware` in large part, plus face
+enrolment and session recording.
+
+The theme is the unglamorous half: tests, Nav2 tuning, simulation setup and
+hardware integration. Those are the parts I would point at in an interview,
+because tuning a Nav2 stack until it stops oscillating and writing the tests
+that catch a regression in face-detection hold are where I learned the most.
